@@ -1,0 +1,267 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <semaphore.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <sys/msg.h>
+
+#define FIFO_NAME "/home/maciek/Documents/CPrograms/projekt/my_fifo"
+#define ByteSize 256
+#define SHM_NAME "/shared_memory"
+
+// Struktury dla kolejek komunikatów
+struct msg_buffer {
+    long msg_type;
+    char msg_text[20];
+};
+
+// Identyfikatory kolejek komunikatów
+int msgid_p1_p2;  // Kolejka dla komunikacji P1 -> P2
+int msgid_p2_p3;  // Kolejka dla komunikacji P2 -> P3
+int msgid_p3_p1;  // Kolejka dla komunikacji P3 -> P1
+
+sem_t *sem_2, *sem_3;  // Pozostawiamy semafory potrzebne do pamięci dzielonej
+char buffer[ByteSize];
+pid_t pid3;
+
+void report_and_exit(const char *msg, int exit_code) {
+    perror(msg);
+    exit(exit_code);
+}
+
+int zlicz_znaki(const char *str) {
+    int count = 0;
+    for (int i = 0; str[i] != '\0'; i++) {
+        if (str[i] != '\n' && str[i] != '\r') count++;
+    }
+    return count;
+}
+
+void signal_handler(int sig) {
+    if (getpid() == pid3) {
+        printf("Otrzymano sygnał %d w procesie %d\n", sig, getpid());
+    }
+}
+
+void P1() {
+    struct msg_buffer message;
+    message.msg_type = 1;
+
+    if (mkfifo(FIFO_NAME, 0666) == -1 && errno != EEXIST) {
+        report_and_exit("mkfifo error", 1);
+    }
+
+    int fd = open(FIFO_NAME, O_WRONLY);
+    if (fd == -1) {
+        report_and_exit("open FIFO error", 1);
+    }
+
+    while (1) {
+        printf("\nMenu:\n");
+        printf("1. Czytaj z klawiatury (stdin)\n");
+        printf("2. Czytaj z pliku (każdy wiersz kończy się <EOL>)\n");
+        printf("Wybierz opcję: ");
+
+        int choice;
+        scanf("%d", &choice);
+        getchar();
+
+        if (choice == 1) {
+            printf("P1(%d): Wprowadz tekst do FIFO: ", getpid());
+            fgets(buffer, ByteSize, stdin);
+
+            if (strncmp(buffer, "exit", 4) == 0) {
+                write(fd, buffer, strlen(buffer) + 1);
+                strcpy(message.msg_text, "start");
+                msgsnd(msgid_p1_p2, &message, sizeof(message.msg_text), 0);
+                break;
+            }
+
+            write(fd, buffer, strlen(buffer) + 1);
+            strcpy(message.msg_text, "start");
+            msgsnd(msgid_p1_p2, &message, sizeof(message.msg_text), 0);
+
+        } else if (choice == 2) {
+            char filename[256];
+            printf("Podaj nazwę pliku: ");
+            fgets(filename, sizeof(filename), stdin);
+            filename[strcspn(filename, "\n")] = 0;
+
+            FILE *file = fopen(filename, "r");
+            if (!file) {
+                perror("Nie udało się otworzyć pliku");
+                continue;
+            }
+
+            while (fgets(buffer, ByteSize, file)) {
+                printf("P1(%d): Wczytano tekst z pliku: %s", getpid(), buffer);
+                printf("P1(%d): Linia wysłana do FIFO\n", getpid());
+                write(fd, buffer, strlen(buffer) + 1);
+                
+                strcpy(message.msg_text, "start");
+                msgsnd(msgid_p1_p2, &message, sizeof(message.msg_text), 0);
+                
+                // Czekaj na sygnał od P3 przez kolejkę
+                msgrcv(msgid_p3_p1, &message, sizeof(message.msg_text), 1, 0);
+            }
+
+            fclose(file);
+        } else {
+            printf("Nieprawidłowy wybór. Spróbuj ponownie.\n");
+        }
+    }
+
+    close(fd);
+}
+
+void P2(char *shared_memory) {
+    struct msg_buffer message;
+    message.msg_type = 1;
+    
+    int fd = open(FIFO_NAME, O_RDONLY);
+    if (fd == -1) {
+        report_and_exit("open FIFO error", 1);
+    }
+
+    while (1) {
+        // Czekaj na sygnał od P1
+        msgrcv(msgid_p1_p2, &message, sizeof(message.msg_text), 1, 0);
+        
+        read(fd, buffer, ByteSize);
+        printf("P2(%d): Dane odczytane z FIFO: %s\n", getpid(), buffer);
+
+        if (strncmp(buffer, "exit", 4) == 0) {
+            strncpy(shared_memory, "exit", ByteSize);
+            sem_post(sem_3);
+            break;
+        }
+
+        int ilosc = zlicz_znaki(buffer);
+        sprintf(shared_memory, "%d", ilosc);
+
+        printf("P2(%d): Ilosc znakow: %d\n", getpid(), ilosc);
+        printf("P2(%d): przekazuje do P3\n", getpid());
+        
+        // Sygnalizuj P3 przez semafor (jak było)
+        sem_post(sem_3);
+        
+        // Wyślij sygnał do P3 przez kolejkę
+        strcpy(message.msg_text, "start");
+        msgsnd(msgid_p2_p3, &message, sizeof(message.msg_text), 0);
+
+        // Czekaj na odpowiedź od P3 przez semafor (jak było)
+        sem_wait(sem_2);
+    }
+
+    close(fd);
+}
+
+void P3(char *shared_memory) {
+    struct msg_buffer message;
+    message.msg_type = 1;
+    
+    while (1) {
+        // Czekaj na sygnał od P2 przez kolejkę
+        msgrcv(msgid_p2_p3, &message, sizeof(message.msg_text), 1, 0);
+        
+        // Czekaj na dane przez semafor (jak było)
+        sem_wait(sem_3);
+
+        if (strncmp(shared_memory, "exit", 4) == 0) {
+            break;
+        }
+
+        printf("P3(%d): Dane odczytane z PD: %s\n\n", getpid(), shared_memory);
+        printf("-------------------------------\n");
+        
+        // Sygnalizuj P2 przez semafor (jak było)
+        sem_post(sem_2);
+        
+        // Wyślij sygnał do P1 przez kolejkę
+        strcpy(message.msg_text, "done");
+        msgsnd(msgid_p3_p1, &message, sizeof(message.msg_text), 0);
+    }
+}
+
+int main() {
+    signal(SIGUSR1, signal_handler);
+    signal(SIGUSR2, signal_handler);
+
+    // Usuń stare semafory
+    sem_unlink("/sem_2");
+    sem_unlink("/sem_3");
+    shm_unlink(SHM_NAME);
+
+    // Utwórz kolejki komunikatów
+    key_t key_p1_p2 = ftok(".", 'A');
+    key_t key_p2_p3 = ftok(".", 'B');
+    key_t key_p3_p1 = ftok(".", 'C');
+
+    msgid_p1_p2 = msgget(key_p1_p2, 0666 | IPC_CREAT);
+    msgid_p2_p3 = msgget(key_p2_p3, 0666 | IPC_CREAT);
+    msgid_p3_p1 = msgget(key_p3_p1, 0666 | IPC_CREAT);
+
+    if (msgid_p1_p2 == -1 || msgid_p2_p3 == -1 || msgid_p3_p1 == -1) {
+        report_and_exit("msgget error", 1);
+    }
+
+    // Utwórz semafory (tylko te potrzebne do pamięci dzielonej)
+    sem_2 = sem_open("/sem_2", O_CREAT | O_EXCL, 0666, 0);
+    sem_3 = sem_open("/sem_3", O_CREAT | O_EXCL, 0666, 0);
+
+    if (sem_2 == SEM_FAILED || sem_3 == SEM_FAILED) {
+        report_and_exit("sem_open error", 1);
+    }
+
+    // Utwórz pamięć dzieloną
+    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        report_and_exit("shm_open error", 1);
+    }
+
+    if (ftruncate(shm_fd, ByteSize) == -1) {
+        report_and_exit("ftruncate error", 1);
+    }
+
+    char *shared_memory = mmap(NULL, ByteSize, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shared_memory == MAP_FAILED) {
+        report_and_exit("mmap error", 1);
+    }
+
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        P2(shared_memory);
+    } else {
+        pid_t pid2 = fork();
+
+        if (pid2 == 0) {
+            pid3 = getpid();
+            P3(shared_memory);
+        } else {
+            P1();
+
+            wait(NULL);
+            wait(NULL);
+
+            // Posprzątaj zasoby
+            sem_unlink("/sem_2");
+            sem_unlink("/sem_3");
+            shm_unlink(SHM_NAME);
+            
+            // Usuń kolejki komunikatów
+            msgctl(msgid_p1_p2, IPC_RMID, NULL);
+            msgctl(msgid_p2_p3, IPC_RMID, NULL);
+            msgctl(msgid_p3_p1, IPC_RMID, NULL);
+        }
+    }
+
+    return 0;
+}
