@@ -89,8 +89,8 @@ void P1() {
 
             while (fgets(buffer, ByteSize, file)) {
                 printf("P1(%d): Wczytano tekst z pliku: %s", getpid(), buffer);
-                write(fd, buffer, strlen(buffer) + 1);
                 printf("P1(%d): Linia wysłana do FIFO\n", getpid());
+                write(fd, buffer, strlen(buffer) + 1);
                 sem_wait(sem_1); // Czekaj na sygnał od P2
             }
 
@@ -125,8 +125,8 @@ void P2(char *shared_memory) {
         sprintf(shared_memory, "%d", ilosc);
 
         printf("P2(%d): Ilosc znakow: %d\n", getpid(), ilosc);
-        sem_post(sem_3); // Sygnał do P3
         printf("P2(%d): przekazuje do P3\n", getpid());
+        sem_post(sem_3); // Sygnał do P3
         sem_wait(sem_2); // Czekaj na odpowiedź od P3
         sem_post(sem_1); // Sygnał do P1
     }
