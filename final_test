@@ -212,7 +212,7 @@ int main() {
         report_and_exit("msgget error", 1);
     }
 
-    // Utwórz semafory (tylko te potrzebne do pamięci dzielonej)
+    // Utwórz semafory
     sem_2 = sem_open("/sem_2", O_CREAT | O_EXCL, 0666, 0);
     sem_3 = sem_open("/sem_3", O_CREAT | O_EXCL, 0666, 0);
 
@@ -235,33 +235,44 @@ int main() {
         report_and_exit("mmap error", 1);
     }
 
-    pid_t pid = fork();
+    printf("Proces macierzysty (PID: %d) tworzy procesy potomne...\n", getpid());
 
-    if (pid == 0) {
-        P2(shared_memory);
-    } else {
-        pid_t pid2 = fork();
-
-        if (pid2 == 0) {
-            pid3 = getpid();
-            P3(shared_memory);
-        } else {
-            P1();
-
-            wait(NULL);
-            wait(NULL);
-
-            // Posprzątaj zasoby
-            sem_unlink("/sem_2");
-            sem_unlink("/sem_3");
-            shm_unlink(SHM_NAME);
-            
-            // Usuń kolejki komunikatów
-            msgctl(msgid_p1_p2, IPC_RMID, NULL);
-            msgctl(msgid_p2_p3, IPC_RMID, NULL);
-            msgctl(msgid_p3_p1, IPC_RMID, NULL);
-        }
+    // Tworzenie procesu P1
+    pid_t pid1 = fork();
+    if (pid1 == 0) {
+        P1();
+        exit(0);
     }
+
+    // Tworzenie procesu P2
+    pid_t pid2 = fork();
+    if (pid2 == 0) {
+        P2(shared_memory);
+        exit(0);
+    }
+
+    // Tworzenie procesu P3
+    pid_t pid3_local = fork();
+    if (pid3_local == 0) {
+        pid3 = getpid();
+        P3(shared_memory);
+        exit(0);
+    }
+
+    // Proces macierzysty czeka na zakończenie wszystkich procesów potomnych
+    wait(NULL);
+    wait(NULL);
+    wait(NULL);
+
+    // Sprzątanie zasobów
+    sem_unlink("/sem_2");
+    sem_unlink("/sem_3");
+    shm_unlink(SHM_NAME);
+    
+    // Usuń kolejki komunikatów
+    msgctl(msgid_p1_p2, IPC_RMID, NULL);
+    msgctl(msgid_p2_p3, IPC_RMID, NULL);
+    msgctl(msgid_p3_p1, IPC_RMID, NULL);
 
     return 0;
 }
