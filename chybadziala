@@ -9,9 +9,9 @@
 #include <semaphore.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
-//#include <signal.h>
+#include <signal.h>
 #include <sys/msg.h>
-#include <asm/signal.h>
+
 
 #define FIFO_NAME "/home/maciek/Documents/CPrograms/projekt/my_fifo"
 #define ByteSize 256
@@ -65,6 +65,9 @@ void signal_handler_start(int sig) {
 } 
 
 void parent_signal_handler(int sig){
+    sigset_t blocker;
+    sigfillset(&blocker);
+    sigprocmask(SIG_BLOCK, &blocker, NULL);
     sigprocmask(SIG_UNBLOCK, &blocker, NULL);
     printf("Proces macierzysty(%d): Otrzymano odbity sygnal %d od P3\n", getpid(), sig);
 
