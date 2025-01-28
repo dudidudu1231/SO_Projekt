@@ -85,11 +85,22 @@ void p3_terminal_handler(int sig) {
     // Obudź rodzica (powiadom że coś czeka w kolejce)
     kill(getppid(), SIGUSR1);
 
-    // Jeśli to SIGTSTP albo SIGCONT, chcemy faktycznie zatrzymać/wznowić P3
-    if (sig == SIGTSTP || sig == SIGCONT) {
-        signal(sig, SIG_DFL);
-        raise(sig);
+    // [POPRAWKA] Usuwamy bezpośrednie raise(SIGTSTP) / raise(SIGCONT).
+    // Chcemy, aby P3 faktycznie wykonał zatrzymanie/wznowienie dopiero,
+    // gdy otrzyma sygnał w łańcuchu od rodzica (w p3_parent_handler).
+    // Dlatego nic dalej tu nie robimy dla SIGTSTP/SIGCONT.
+
+    // Jeśli to np. SIGINT czy SIGTERM z terminala,
+    // można zakończyć *lokalnie* (jeśli tak chcemy).
+    // Na razie – tak jak w oryginale:
+    if (sig == SIGINT) {
+        // ewentualnie NIC tu nie robimy,
+        // bo i tak rodzic roześle łańcuchem.
     }
+    else if (sig == SIGTERM) {
+        // j.w.
+    }
+    // Pozostałe sygnały – brak akcji.
 }
 
 // ********** P3: sygnały od rodzica (łańcuch) **********
@@ -184,6 +195,9 @@ void p1_parent_handler(int sig) {
 
 // ********** RODZIC: sygnał SIGUSR1 przychodzi od P3 **********
 void parent_sigusr1_handler(int sig) {
+    // [UWAGA] W praktyce msgrcv w handlerze nie jest async-signal-safe,
+    // ale pozostawiamy to tak, jak w oryginale.
+
     // Najpierw odczytujemy z kolejki msgid_p3 (child->parent), mtype=1
     sigmsg_t msg;
     if (msgrcv(msgid_p3, &msg, sizeof(msg.signal), 1, 0) == -1) {
@@ -427,14 +441,13 @@ void P2(char *shared_memory) {
 // ------------------------- KOD PROCESU P3 ------------------------------
 // ----------------------------------------------------------------------
 void P3(char *shared_memory) {
-    // P3 ma dwa rodzaje sygnałów:
-    // 1) Z terminala (SIGINT, SIGTERM, SIGTSTP, SIGCONT) => p3_terminal_handler
+    // P3 przechwytuje sygnały z terminala:
     signal(SIGINT,  p3_terminal_handler);
     signal(SIGTERM, p3_terminal_handler);
     signal(SIGTSTP, p3_terminal_handler);
     signal(SIGCONT, p3_terminal_handler);
 
-    // 2) Od rodzica w łańcuchu => p3_parent_handler
+    // 2) Odbiera też sygnały od rodzica (łańcuch)
     signal(SIGUSR1, p3_parent_handler);
 
     while (1) {
