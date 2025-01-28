@@ -17,7 +17,6 @@
 #define ByteSize    256
 #define SHM_NAME    "/shared_memory"
 
-//--------------------------------------------------------
 // Struktura do przesyłania sygnałów (łańcuch SIGUSR1)
 struct sig_buffer {
     long mtype;
@@ -30,18 +29,12 @@ struct msg_data {
     char msg_text[20];
 };
 
-//--------------------------------------------------------
-// Zmienne globalne
-//--------------------------------------------------------
-
-// Kolejki sygnałowe
 int msgidSigP1;
 int msgidSigP2;
 int msgidSigP3;
 // Kolejka sygnałowa P3->rodzic
 int msgidSigParent;
 
-// Kolejka danych TYLKO P3 -> P1
 int msgid_p3_p1;
 
 sem_t *sem_2, *sem_3;
@@ -51,15 +44,12 @@ pid_t pid1, pid2, pid3, parentPID;
 volatile sig_atomic_t g_paused = 0;
 volatile sig_atomic_t g_terminate = 0;
 
-//--------------------------------------------------------
-// Funkcje pomocnicze
-//--------------------------------------------------------
 void report_and_exit(const char *msg, int exit_code) {
     perror(msg);
     exit(exit_code);
 }
 
-// Liczenie znaków (bez \n i \r)
+
 int zlicz_znaki(const char *str) {
     int count = 0;
     for (int i = 0; str[i] != '\0'; i++) {
@@ -69,9 +59,6 @@ int zlicz_znaki(const char *str) {
     return count;
 }
 
-//--------------------------------------------------------
-// Wysyłanie/odbiór sygnałów przez kolejki
-//--------------------------------------------------------
 void sendSignalMsg(int msqID, int sigval) {
     struct sig_buffer s;
     s.mtype  = 1;
@@ -97,9 +84,6 @@ int receiveSignalMsg(int msqID) {
     }
 }
 
-//--------------------------------------------------------
-// Handlery łańcucha SIGUSR1 (P1 -> P2 -> P3)
-//--------------------------------------------------------
 static void handlerSIGUSR1_P1(int sig) {
     int val = receiveSignalMsg(msgidSigP1);
     if (val == -1) return; // msgrcv przerwane lub błąd
@@ -151,9 +135,6 @@ static void handlerSIGUSR1_P3(int sig) {
     // koniec kaskady
 }
 
-//--------------------------------------------------------
-// Handlery sygnałów w P3 (SIGTSTP/CONT/TERM -> kill rodzica)
-//--------------------------------------------------------
 static void handlerSIGTSTP_P3(int sig, siginfo_t *info, void *ctx) {
     printf("[P3] Otrzymalem SIGTSTP. Przekazuje do rodzica.\n");
     sendSignalMsg(msgidSigParent, SIGTSTP);
@@ -172,10 +153,6 @@ static void handlerSIGTERM_P3(int sig, siginfo_t *info, void *ctx) {
     kill(parentPID, SIGUSR1);
 }
 
-//--------------------------------------------------------
-// Handler w rodzicu na SIGUSR1
-//  - odczytuje sygnał z kolejki P3->rodzic i rozsyła do P1,P2,P3
-//--------------------------------------------------------
 static void handlerSIGUSR1_parent(int sig) {
     int val = receiveSignalMsg(msgidSigParent);
     if (val < 0) return;  // błąd msgrcv
@@ -191,9 +168,7 @@ static void handlerSIGUSR1_parent(int sig) {
     kill(pid1, SIGUSR1);
 }
 
-//--------------------------------------------------------
-// Funkcje ignorowania sygnałów w P1/P2 i P3
-//--------------------------------------------------------
+
 static void ignoreAllButSIGUSR1_P1_P2(void) {
     for (int i=1; i<32; i++) {
         if (i == SIGKILL || i == SIGSTOP) continue;
@@ -211,9 +186,7 @@ static void ignoreAllButThese_P3(void) {
     }
 }
 
-//--------------------------------------------------------
-// Proces P1 (FIFO: pisanie do P2) + czekanie na "done" od P3
-//--------------------------------------------------------
+
 void P1() {
     ignoreAllButSIGUSR1_P1_P2();
 
@@ -374,9 +347,7 @@ void P1() {
     exit(0);
 }
 
-//--------------------------------------------------------
-// Proces P2 (LINIOWE odczytywanie z FIFO => semafory => P3)
-//--------------------------------------------------------
+
 void P2(char *shared_memory) {
     ignoreAllButSIGUSR1_P1_P2();
 
@@ -436,9 +407,7 @@ void P2(char *shared_memory) {
     exit(0);
 }
 
-//--------------------------------------------------------
-// Proces P3 (semafory + pamięć dzielona) + wysyłanie "done" do P1
-//--------------------------------------------------------
+
 void P3(char *shared_memory) {
     ignoreAllButThese_P3();
 
@@ -501,9 +470,6 @@ void P3(char *shared_memory) {
     exit(0);
 }
 
-//--------------------------------------------------------
-// main (rodzic)
-//--------------------------------------------------------
 int main() {
     parentPID = getpid();
 
