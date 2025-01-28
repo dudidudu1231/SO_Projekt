@@ -18,11 +18,16 @@
 #define SHM_NAME    "/shared_memory"
 
 //--------------------------------------------------------
-// Struktura do przesyłania sygnałów przez kolejki
-//--------------------------------------------------------
+// Struktura do przesyłania sygnałów (łańcuch SIGUSR1)
 struct sig_buffer {
     long mtype;
     int  sigval;
+};
+
+// Struktura do przesyłania danych (P3 -> P1), np. "done"
+struct msg_data {
+    long msg_type;
+    char msg_text[20];
 };
 
 //--------------------------------------------------------
@@ -36,7 +41,9 @@ int msgidSigP3;
 // Kolejka sygnałowa P3->rodzic
 int msgidSigParent;
 
-// Semafory i bufor
+// Kolejka danych TYLKO P3 -> P1
+int msgid_p3_p1;
+
 sem_t *sem_2, *sem_3;
 char   buffer[ByteSize];
 
@@ -80,7 +87,8 @@ int receiveSignalMsg(int msqID) {
         ssize_t rc = msgrcv(msqID, &s, sizeof(s.sigval), 0, 0);
         if (rc == -1) {
             if (errno == EINTR && !g_terminate) {
-                continue; // powtarzamy, jeśli przerwano sygnałem
+                // powtarzamy, jeśli przerwano sygnałem
+                continue;
             }
             perror("msgrcv error (signal)");
             return -1;
@@ -204,19 +212,18 @@ static void ignoreAllButThese_P3(void) {
 }
 
 //--------------------------------------------------------
-// Proces P1 (FIFO: pisanie do P2)
+// Proces P1 (FIFO: pisanie do P2) + czekanie na "done" od P3
 //--------------------------------------------------------
 void P1() {
-    // ignoruj sygnały poza SIGUSR1
     ignoreAllButSIGUSR1_P1_P2();
 
-    // Ustaw handler łańcucha SIGUSR1
+    // Handler SIGUSR1
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handlerSIGUSR1_P1;
     sigaction(SIGUSR1, &sa, NULL);
 
-    // Tworzymy/otwieramy FIFO do zapisu
+    // Przygotowanie FIFO do zapisu
     unlink(FIFO_NAME);
     if (mkfifo(FIFO_NAME, 0666) == -1 && errno != EEXIST) {
         report_and_exit("mkfifo (P1) error", 1);
@@ -226,137 +233,141 @@ void P1() {
         report_and_exit("open FIFO (P1) error", 1);
     }
 
-    // Bufor do wczytywania tekstu
-    char buffer[ByteSize];
-
-    // Pętla główna
     while (!g_terminate) {
-        // Busy loop w razie pauzy
+        // Busy-loop w czasie pauzy
         while (g_paused && !g_terminate) {
-            // nic
+            /* nic - pętla zajętości */
         }
         if (g_terminate) break;
 
-        // Wyświetl menu
         printf("\n[P1] Menu:\n");
-        printf("1. Czytaj z klawiatury (koniec wpisaniem '.' w osobnej linii)\n");
+        printf("1. Czytaj z klawiatury (koniec: '.')\n");
         printf("2. Czytaj z pliku (do EOF)\n");
         printf("Wybierz opcje: ");
         fflush(stdout);
 
-        // Wczytaj wybór
         int choice;
         if (scanf("%d", &choice) != 1) {
-            // czyszczenie bufora w razie błędu
-            int c;
-            while ((c = getchar()) != '\n' && c != EOF) { }
-            printf("[P1] Nieprawidlowy wybor (brak liczby).\n");
-            continue; // wróć do while => pokaż menu ponownie
+            // czyszczenie bufora
+            int c; while ((c = getchar()) != '\n' && c != EOF) {}
+            printf("[P1] Nieprawidlowy wybor.\n");
+            continue;
         }
-        // usuwamy ewentualne resztki w buforze
-        int c;
-        while ((c = getchar()) != '\n' && c != EOF) { }
+        int c; while ((c=getchar())!='\n' && c!=EOF) {}
 
-        // Reakcja na choice
         if (choice == 1) {
-            // >>> Pętla czytania z klawiatury <<<
+            // --- Czytanie z klawiatury ---
             while (!g_terminate) {
-                while (g_paused && !g_terminate) { }
+                while (g_paused && !g_terminate) {}
                 if (g_terminate) break;
 
                 printf("[P1] Wpisz tekst ('.' konczy): ");
                 fflush(stdout);
 
-                // wczytaj jedną linię
                 if (!fgets(buffer, ByteSize, stdin)) {
-                    // np. EOF albo błąd
                     if (feof(stdin)) {
                         printf("[P1] EOF na stdin.\n");
                     } else {
                         perror("[P1] Blad odczytu stdin");
                     }
-                    break;  // wyjdź z pętli klawiatury, wróć do menu
+                    break; // do menu
                 }
-                // usuń trailing newline
                 buffer[strcspn(buffer, "\n")] = '\0';
 
                 if (strcmp(buffer, ".") == 0) {
                     printf("[P1] Koniec wczytywania z klawiatury.\n");
-                    break; // wróć do menu
+                    break;
                 }
 
-                // Dopisz \n przed zapisem do FIFO, by mieć osobne linie
+                // dopisz \n
                 size_t len = strlen(buffer);
                 buffer[len]   = '\n';
                 buffer[len+1] = '\0';
 
-                // Zapis do FIFO (obsługa EINTR)
+                // write do FIFO
                 ssize_t wret;
                 do {
                     wret = write(fd, buffer, len+1);
                 } while (wret == -1 && errno == EINTR && !g_terminate);
-
                 if (wret < 0) {
                     perror("[P1] write FIFO error");
-                    break;  // wyjdź z pętli klawiatury
+                    break;
                 }
+
+                // * Czekamy na "done" od P3 (blokujemy do msgrcv) *
+                struct msg_data m;
+                if (msgrcv(msgid_p3_p1, &m, sizeof(m.msg_text), 1, 0) == -1) {
+                    if (errno == EINTR && !g_terminate) {
+                        continue;
+                    }
+                    perror("[P1] msgrcv p3->p1");
+                    break;
+                }
+
+                if (g_terminate) break;
             }
-            // koniec choice==1 => wróciliśmy do while(!g_terminate), pokaż menu
         }
         else if (choice == 2) {
-            // >>> Pętla czytania z pliku <<<
+            // --- Czytanie z pliku ---
             char filename[256];
-            printf("[P1] Podaj nazwę pliku: ");
+            printf("[P1] Podaj nazwe pliku: ");
             fflush(stdout);
             if (!fgets(filename, sizeof(filename), stdin)) {
                 fprintf(stderr, "[P1] Blad odczytu nazwy pliku.\n");
-                continue; // wróć do menu
+                continue;
             }
             filename[strcspn(filename, "\n")] = '\0';
 
             FILE *file = fopen(filename, "r");
             if (!file) {
-                perror("[P1] Nie udalo sie otworzyc pliku");
-                continue; // wróć do menu
+                perror("[P1] Nie mozna otworzyc pliku");
+                continue;
             }
 
             while (!g_terminate) {
-                while (g_paused && !g_terminate) { }
+                while (g_paused && !g_terminate) {}
                 if (g_terminate) break;
 
-                // wczytaj jedną linię z pliku
-                if (!fgets(buffer, ByteSize, file)) {
+                char *p = fgets(buffer, ByteSize, file);
+                if (!p) {
                     if (!feof(file)) {
-                        perror("[P1] Blad odczytu pliku");
+                        perror("[P1] blad odczytu pliku");
                     }
                     printf("[P1] Koniec pliku.\n");
-                    break; // wyjdź z pętli pliku => wróć do menu
+                    break;
                 }
-
                 printf("[P1] Wczytano z pliku: %s", buffer);
 
-                // Zapis do FIFO
                 size_t toWrite = strlen(buffer);
+                // write do FIFO
                 ssize_t wret;
                 do {
                     wret = write(fd, buffer, toWrite);
                 } while (wret == -1 && errno == EINTR && !g_terminate);
-
                 if (wret < 0) {
                     perror("[P1] write FIFO error");
                     break;
                 }
+
+                // * Czekamy na "done" od P3 *
+                struct msg_data m;
+                if (msgrcv(msgid_p3_p1, &m, sizeof(m.msg_text), 1, 0) == -1) {
+                    if (errno == EINTR && !g_terminate) {
+                        continue;
+                    }
+                    perror("[P1] msgrcv p3->p1");
+                    break;
+                }
+
+                if (g_terminate) break;
             }
             fclose(file);
-            // koniec choice==2 => wróciliśmy do while(!g_terminate), pokaż menu
         }
         else {
-            printf("[P1] Nieprawidlowy wybor (podaj 1 lub 2).\n");
+            printf("[P1] Nieprawidlowy wybor.\n");
         }
-        // pętla while(!g_terminate) wraca do góry => wyświetli menu ponownie
     }
 
-    // Po wyjściu z pętli => koniec
     close(fd);
     printf("[P1] Koncze dzialanie.\n");
     fflush(stdout);
@@ -374,7 +385,7 @@ void P2(char *shared_memory) {
     sa.sa_handler = handlerSIGUSR1_P2;
     sigaction(SIGUSR1, &sa, NULL);
 
-    // Otwieramy FIFO jako strumień plikowy, aby użyć fgets (linia po linii)
+    // Otwieramy FIFO jako strumień, aby użyć fgets (linia po linii)
     int fd = open(FIFO_NAME, O_RDONLY);
     if (fd < 0) {
         report_and_exit("open FIFO (P2) error", 1);
@@ -385,13 +396,10 @@ void P2(char *shared_memory) {
     }
 
     while (!g_terminate) {
-        // Busy loop w pauzie
-        while (g_paused && !g_terminate) {
-            /* nic */
-        }
+        while (g_paused && !g_terminate) {}
         if (g_terminate) break;
 
-        // Odczyt jednej linii z FIFO
+        // Odczyt jednej linii z FIFO (fgets)
         char *res = fgets(buffer, ByteSize, f);
         if (!res) {
             if (feof(f)) {
@@ -401,10 +409,8 @@ void P2(char *shared_memory) {
             }
             break;
         }
-        // Mamy linijkę w buffer
         printf("[P2] Dane odczytane z FIFO: %s", buffer);
 
-        // Policz znaki (bez \n i \r)
         int ilosc = zlicz_znaki(buffer);
         sprintf(shared_memory, "%d", ilosc);
         printf("[P2] Ilosc znakow: %d => przekazuje do P3\n", ilosc);
@@ -431,7 +437,7 @@ void P2(char *shared_memory) {
 }
 
 //--------------------------------------------------------
-// Proces P3 (semafory + pamięć dzielona)
+// Proces P3 (semafory + pamięć dzielona) + wysyłanie "done" do P1
 //--------------------------------------------------------
 void P3(char *shared_memory) {
     ignoreAllButThese_P3();
@@ -442,7 +448,7 @@ void P3(char *shared_memory) {
     sa_usr1.sa_handler = handlerSIGUSR1_P3;
     sigaction(SIGUSR1, &sa_usr1, NULL);
 
-    // Handlery SIGTSTP, SIGCONT, SIGTERM z SA_SIGINFO
+    // Handlery SIGTSTP, SIGCONT, SIGTERM
     struct sigaction sa_tstp, sa_cont, sa_term;
     memset(&sa_tstp, 0, sizeof(sa_tstp));
     sa_tstp.sa_flags = SA_SIGINFO;
@@ -460,10 +466,7 @@ void P3(char *shared_memory) {
     sigaction(SIGTERM, &sa_term, NULL);
 
     while (!g_terminate) {
-        // Busy loop w pauzie
-        while (g_paused && !g_terminate) {
-            /* nic */
-        }
+        while (g_paused && !g_terminate) {}
         if (g_terminate) break;
 
         // czekamy, aż P2 da nam znać (sem_3)
@@ -482,6 +485,15 @@ void P3(char *shared_memory) {
         do {
             sw = sem_post(sem_2);
         } while (sw == -1 && errno == EINTR && !g_terminate);
+
+        // * Wyślij "done" do P1 (blokuje P1 do tego momentu) *
+        struct msg_data m;
+        m.msg_type = 1;
+        strcpy(m.msg_text, "done");
+        if (msgsnd(msgid_p3_p1, &m, sizeof(m.msg_text), 0) == -1) {
+            perror("[P3] msgsnd p3->p1");
+            // nie przerywamy pętli, ale sygnał do P1 nie dotrze
+        }
     }
 
     printf("[P3] Koncze dzialanie.\n");
@@ -517,6 +529,13 @@ int main() {
     msgidSigParent = msgget(key_s_parent, 0666 | IPC_CREAT);
     if (msgidSigParent == -1) {
         report_and_exit("msgget signal-parent error", 1);
+    }
+
+    // * Kolejka danych P3->P1 *
+    key_t key_p3_p1 = ftok(".", 'C');
+    msgid_p3_p1 = msgget(key_p3_p1, 0666 | IPC_CREAT);
+    if (msgid_p3_p1 == -1) {
+        report_and_exit("msgget p3->p1 error", 1);
     }
 
     // Semafory
@@ -581,6 +600,9 @@ int main() {
     msgctl(msgidSigP2, IPC_RMID, NULL);
     msgctl(msgidSigP3, IPC_RMID, NULL);
     msgctl(msgidSigParent, IPC_RMID, NULL);
+
+    // Usuwamy kolejkę danych p3->p1
+    msgctl(msgid_p3_p1, IPC_RMID, NULL);
 
     printf("[Parent] Wszystkie procesy zakonczone. Zasoby zwolnione.\n");
     return 0;
