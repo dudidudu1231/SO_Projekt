@@ -1,0 +1,587 @@
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <semaphore.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <sys/msg.h>
+
+#define FIFO_NAME   "/home/maciek/Documents/CPrograms/projekt/my_fifo"
+#define ByteSize    256
+#define SHM_NAME    "/shared_memory"
+
+//--------------------------------------------------------
+// Struktura do przesyłania sygnałów przez kolejki
+//--------------------------------------------------------
+struct sig_buffer {
+    long mtype;
+    int  sigval;
+};
+
+//--------------------------------------------------------
+// Zmienne globalne
+//--------------------------------------------------------
+
+// Kolejki sygnałowe
+int msgidSigP1;
+int msgidSigP2;
+int msgidSigP3;
+// Kolejka sygnałowa P3->rodzic
+int msgidSigParent;
+
+// Semafory i bufor
+sem_t *sem_2, *sem_3;
+char   buffer[ByteSize];
+
+pid_t pid1, pid2, pid3, parentPID;
+volatile sig_atomic_t g_paused = 0;
+volatile sig_atomic_t g_terminate = 0;
+
+//--------------------------------------------------------
+// Funkcje pomocnicze
+//--------------------------------------------------------
+void report_and_exit(const char *msg, int exit_code) {
+    perror(msg);
+    exit(exit_code);
+}
+
+// Liczenie znaków (bez \n i \r)
+int zlicz_znaki(const char *str) {
+    int count = 0;
+    for (int i = 0; str[i] != '\0'; i++) {
+        if (str[i] != '\n' && str[i] != '\r')
+            count++;
+    }
+    return count;
+}
+
+//--------------------------------------------------------
+// Wysyłanie/odbiór sygnałów przez kolejki
+//--------------------------------------------------------
+void sendSignalMsg(int msqID, int sigval) {
+    struct sig_buffer s;
+    s.mtype  = 1;
+    s.sigval = sigval;
+    if (msgsnd(msqID, &s, sizeof(s.sigval), 0) == -1) {
+        perror("msgsnd error (signal)");
+    }
+}
+
+int receiveSignalMsg(int msqID) {
+    while (1) {
+        struct sig_buffer s;
+        ssize_t rc = msgrcv(msqID, &s, sizeof(s.sigval), 0, 0);
+        if (rc == -1) {
+            if (errno == EINTR && !g_terminate) {
+                continue; // powtarzamy, jeśli przerwano sygnałem
+            }
+            perror("msgrcv error (signal)");
+            return -1;
+        }
+        return s.sigval;
+    }
+}
+
+//--------------------------------------------------------
+// Handlery łańcucha SIGUSR1 (P1 -> P2 -> P3)
+//--------------------------------------------------------
+static void handlerSIGUSR1_P1(int sig) {
+    int val = receiveSignalMsg(msgidSigP1);
+    if (val == -1) return; // msgrcv przerwane lub błąd
+
+    if (val == SIGTSTP) {
+        g_paused = 1;
+        printf("[P1] => SIGTSTP: pauza.\n");
+    } else if (val == SIGCONT) {
+        g_paused = 0;
+        printf("[P1] => SIGCONT: wznowienie.\n");
+    } else if (val == SIGTERM) {
+        g_terminate = 1;
+        printf("[P1] => SIGTERM: koncze prace.\n");
+    }
+    kill(pid2, SIGUSR1);  // przekaz dalej do P2
+}
+
+static void handlerSIGUSR1_P2(int sig) {
+    int val = receiveSignalMsg(msgidSigP2);
+    if (val == -1) return;
+
+    if (val == SIGTSTP) {
+        g_paused = 1;
+        printf("[P2] => SIGTSTP: pauza.\n");
+    } else if (val == SIGCONT) {
+        g_paused = 0;
+        printf("[P2] => SIGCONT: wznowienie.\n");
+    } else if (val == SIGTERM) {
+        g_terminate = 1;
+        printf("[P2] => SIGTERM: koncze prace.\n");
+    }
+    kill(pid3, SIGUSR1);
+}
+
+static void handlerSIGUSR1_P3(int sig) {
+    int val = receiveSignalMsg(msgidSigP3);
+    if (val == -1) return;
+
+    if (val == SIGTSTP) {
+        g_paused = 1;
+        printf("[P3] => SIGTSTP: pauza.\n");
+    } else if (val == SIGCONT) {
+        g_paused = 0;
+        printf("[P3] => SIGCONT: wznowienie.\n");
+    } else if (val == SIGTERM) {
+        g_terminate = 1;
+        printf("[P3] => SIGTERM: koncze prace.\n");
+    }
+    // koniec kaskady
+}
+
+//--------------------------------------------------------
+// Handlery sygnałów w P3 (SIGTSTP/CONT/TERM -> kill rodzica)
+//--------------------------------------------------------
+static void handlerSIGTSTP_P3(int sig, siginfo_t *info, void *ctx) {
+    printf("[P3] Otrzymalem SIGTSTP. Przekazuje do rodzica.\n");
+    sendSignalMsg(msgidSigParent, SIGTSTP);
+    kill(parentPID, SIGUSR1);
+}
+
+static void handlerSIGCONT_P3(int sig, siginfo_t *info, void *ctx) {
+    printf("[P3] Otrzymalem SIGCONT. Przekazuje do rodzica.\n");
+    sendSignalMsg(msgidSigParent, SIGCONT);
+    kill(parentPID, SIGUSR1);
+}
+
+static void handlerSIGTERM_P3(int sig, siginfo_t *info, void *ctx) {
+    printf("[P3] Otrzymalem SIGTERM. Przekazuje do rodzica.\n");
+    sendSignalMsg(msgidSigParent, SIGTERM);
+    kill(parentPID, SIGUSR1);
+}
+
+//--------------------------------------------------------
+// Handler w rodzicu na SIGUSR1
+//  - odczytuje sygnał z kolejki P3->rodzic i rozsyła do P1,P2,P3
+//--------------------------------------------------------
+static void handlerSIGUSR1_parent(int sig) {
+    int val = receiveSignalMsg(msgidSigParent);
+    if (val < 0) return;  // błąd msgrcv
+
+    printf("[Parent] Odczytalem od P3 sygnal = %d (rozsylam)\n", val);
+
+    // rozsyłamy do P1, P2, P3
+    sendSignalMsg(msgidSigP1, val);
+    sendSignalMsg(msgidSigP2, val);
+    sendSignalMsg(msgidSigP3, val);
+
+    // uruchamiamy kaskadę sygnałów
+    kill(pid1, SIGUSR1);
+}
+
+//--------------------------------------------------------
+// Funkcje ignorowania sygnałów w P1/P2 i P3
+//--------------------------------------------------------
+static void ignoreAllButSIGUSR1_P1_P2(void) {
+    for (int i=1; i<32; i++) {
+        if (i == SIGKILL || i == SIGSTOP) continue;
+        if (i == SIGUSR1) continue;
+        signal(i, SIG_IGN);
+    }
+}
+
+static void ignoreAllButThese_P3(void) {
+    for (int i=1; i<32; i++) {
+        if (i == SIGKILL || i == SIGSTOP) continue;
+        if (i == SIGTSTP || i == SIGCONT || i == SIGTERM || i == SIGUSR1)
+            continue;
+        signal(i, SIG_IGN);
+    }
+}
+
+//--------------------------------------------------------
+// Proces P1 (FIFO: pisanie do P2)
+//--------------------------------------------------------
+void P1() {
+    // ignoruj sygnały poza SIGUSR1
+    ignoreAllButSIGUSR1_P1_P2();
+
+    // Ustaw handler łańcucha SIGUSR1
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handlerSIGUSR1_P1;
+    sigaction(SIGUSR1, &sa, NULL);
+
+    // Tworzymy/otwieramy FIFO do zapisu
+    unlink(FIFO_NAME);
+    if (mkfifo(FIFO_NAME, 0666) == -1 && errno != EEXIST) {
+        report_and_exit("mkfifo (P1) error", 1);
+    }
+    int fd = open(FIFO_NAME, O_WRONLY);
+    if (fd < 0) {
+        report_and_exit("open FIFO (P1) error", 1);
+    }
+
+    // Bufor do wczytywania tekstu
+    char buffer[ByteSize];
+
+    // Pętla główna
+    while (!g_terminate) {
+        // Busy loop w razie pauzy
+        while (g_paused && !g_terminate) {
+            // nic
+        }
+        if (g_terminate) break;
+
+        // Wyświetl menu
+        printf("\n[P1] Menu:\n");
+        printf("1. Czytaj z klawiatury (koniec wpisaniem '.' w osobnej linii)\n");
+        printf("2. Czytaj z pliku (do EOF)\n");
+        printf("Wybierz opcje: ");
+        fflush(stdout);
+
+        // Wczytaj wybór
+        int choice;
+        if (scanf("%d", &choice) != 1) {
+            // czyszczenie bufora w razie błędu
+            int c;
+            while ((c = getchar()) != '\n' && c != EOF) { }
+            printf("[P1] Nieprawidlowy wybor (brak liczby).\n");
+            continue; // wróć do while => pokaż menu ponownie
+        }
+        // usuwamy ewentualne resztki w buforze
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF) { }
+
+        // Reakcja na choice
+        if (choice == 1) {
+            // >>> Pętla czytania z klawiatury <<<
+            while (!g_terminate) {
+                while (g_paused && !g_terminate) { }
+                if (g_terminate) break;
+
+                printf("[P1] Wpisz tekst ('.' konczy): ");
+                fflush(stdout);
+
+                // wczytaj jedną linię
+                if (!fgets(buffer, ByteSize, stdin)) {
+                    // np. EOF albo błąd
+                    if (feof(stdin)) {
+                        printf("[P1] EOF na stdin.\n");
+                    } else {
+                        perror("[P1] Blad odczytu stdin");
+                    }
+                    break;  // wyjdź z pętli klawiatury, wróć do menu
+                }
+                // usuń trailing newline
+                buffer[strcspn(buffer, "\n")] = '\0';
+
+                if (strcmp(buffer, ".") == 0) {
+                    printf("[P1] Koniec wczytywania z klawiatury.\n");
+                    break; // wróć do menu
+                }
+
+                // Dopisz \n przed zapisem do FIFO, by mieć osobne linie
+                size_t len = strlen(buffer);
+                buffer[len]   = '\n';
+                buffer[len+1] = '\0';
+
+                // Zapis do FIFO (obsługa EINTR)
+                ssize_t wret;
+                do {
+                    wret = write(fd, buffer, len+1);
+                } while (wret == -1 && errno == EINTR && !g_terminate);
+
+                if (wret < 0) {
+                    perror("[P1] write FIFO error");
+                    break;  // wyjdź z pętli klawiatury
+                }
+            }
+            // koniec choice==1 => wróciliśmy do while(!g_terminate), pokaż menu
+        }
+        else if (choice == 2) {
+            // >>> Pętla czytania z pliku <<<
+            char filename[256];
+            printf("[P1] Podaj nazwę pliku: ");
+            fflush(stdout);
+            if (!fgets(filename, sizeof(filename), stdin)) {
+                fprintf(stderr, "[P1] Blad odczytu nazwy pliku.\n");
+                continue; // wróć do menu
+            }
+            filename[strcspn(filename, "\n")] = '\0';
+
+            FILE *file = fopen(filename, "r");
+            if (!file) {
+                perror("[P1] Nie udalo sie otworzyc pliku");
+                continue; // wróć do menu
+            }
+
+            while (!g_terminate) {
+                while (g_paused && !g_terminate) { }
+                if (g_terminate) break;
+
+                // wczytaj jedną linię z pliku
+                if (!fgets(buffer, ByteSize, file)) {
+                    if (!feof(file)) {
+                        perror("[P1] Blad odczytu pliku");
+                    }
+                    printf("[P1] Koniec pliku.\n");
+                    break; // wyjdź z pętli pliku => wróć do menu
+                }
+
+                printf("[P1] Wczytano z pliku: %s", buffer);
+
+                // Zapis do FIFO
+                size_t toWrite = strlen(buffer);
+                ssize_t wret;
+                do {
+                    wret = write(fd, buffer, toWrite);
+                } while (wret == -1 && errno == EINTR && !g_terminate);
+
+                if (wret < 0) {
+                    perror("[P1] write FIFO error");
+                    break;
+                }
+            }
+            fclose(file);
+            // koniec choice==2 => wróciliśmy do while(!g_terminate), pokaż menu
+        }
+        else {
+            printf("[P1] Nieprawidlowy wybor (podaj 1 lub 2).\n");
+        }
+        // pętla while(!g_terminate) wraca do góry => wyświetli menu ponownie
+    }
+
+    // Po wyjściu z pętli => koniec
+    close(fd);
+    printf("[P1] Koncze dzialanie.\n");
+    fflush(stdout);
+    exit(0);
+}
+
+//--------------------------------------------------------
+// Proces P2 (LINIOWE odczytywanie z FIFO => semafory => P3)
+//--------------------------------------------------------
+void P2(char *shared_memory) {
+    ignoreAllButSIGUSR1_P1_P2();
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handlerSIGUSR1_P2;
+    sigaction(SIGUSR1, &sa, NULL);
+
+    // Otwieramy FIFO jako strumień plikowy, aby użyć fgets (linia po linii)
+    int fd = open(FIFO_NAME, O_RDONLY);
+    if (fd < 0) {
+        report_and_exit("open FIFO (P2) error", 1);
+    }
+    FILE *f = fdopen(fd, "r");
+    if (!f) {
+        report_and_exit("fdopen (P2) error", 1);
+    }
+
+    while (!g_terminate) {
+        // Busy loop w pauzie
+        while (g_paused && !g_terminate) {
+            /* nic */
+        }
+        if (g_terminate) break;
+
+        // Odczyt jednej linii z FIFO
+        char *res = fgets(buffer, ByteSize, f);
+        if (!res) {
+            if (feof(f)) {
+                printf("[P2] Koniec FIFO (EOF)\n");
+            } else {
+                perror("[P2] fgets FIFO error");
+            }
+            break;
+        }
+        // Mamy linijkę w buffer
+        printf("[P2] Dane odczytane z FIFO: %s", buffer);
+
+        // Policz znaki (bez \n i \r)
+        int ilosc = zlicz_znaki(buffer);
+        sprintf(shared_memory, "%d", ilosc);
+        printf("[P2] Ilosc znakow: %d => przekazuje do P3\n", ilosc);
+
+        // Poinformuj P3: sem_post(sem_3)
+        int pret;
+        do {
+            pret = sem_post(sem_3);
+        } while (pret == -1 && errno == EINTR && !g_terminate);
+
+        // Teraz P2 czeka, aż P3 skończy (sem_wait(sem_2))
+        int wret;
+        do {
+            wret = sem_wait(sem_2);
+        } while (wret == -1 && errno == EINTR && !g_terminate);
+
+        if (g_terminate) break;
+    }
+
+    fclose(f); // to też zamknie fd
+    printf("[P2] Koncze dzialanie.\n");
+    fflush(stdout);
+    exit(0);
+}
+
+//--------------------------------------------------------
+// Proces P3 (semafory + pamięć dzielona)
+//--------------------------------------------------------
+void P3(char *shared_memory) {
+    ignoreAllButThese_P3();
+
+    // Handler łańcucha SIGUSR1
+    struct sigaction sa_usr1;
+    memset(&sa_usr1, 0, sizeof(sa_usr1));
+    sa_usr1.sa_handler = handlerSIGUSR1_P3;
+    sigaction(SIGUSR1, &sa_usr1, NULL);
+
+    // Handlery SIGTSTP, SIGCONT, SIGTERM z SA_SIGINFO
+    struct sigaction sa_tstp, sa_cont, sa_term;
+    memset(&sa_tstp, 0, sizeof(sa_tstp));
+    sa_tstp.sa_flags = SA_SIGINFO;
+    sa_tstp.sa_sigaction = handlerSIGTSTP_P3;
+    sigaction(SIGTSTP, &sa_tstp, NULL);
+
+    memset(&sa_cont, 0, sizeof(sa_cont));
+    sa_cont.sa_flags = SA_SIGINFO;
+    sa_cont.sa_sigaction = handlerSIGCONT_P3;
+    sigaction(SIGCONT, &sa_cont, NULL);
+
+    memset(&sa_term, 0, sizeof(sa_term));
+    sa_term.sa_flags = SA_SIGINFO;
+    sa_term.sa_sigaction = handlerSIGTERM_P3;
+    sigaction(SIGTERM, &sa_term, NULL);
+
+    while (!g_terminate) {
+        // Busy loop w pauzie
+        while (g_paused && !g_terminate) {
+            /* nic */
+        }
+        if (g_terminate) break;
+
+        // czekamy, aż P2 da nam znać (sem_3)
+        int sw;
+        do {
+            sw = sem_wait(sem_3);
+        } while (sw == -1 && errno == EINTR && !g_terminate);
+
+        if (g_terminate) break;
+
+        // Odczyt danych z pamięci dzielonej
+        printf("[P3] Dane odczytane z PD: %s\n", shared_memory);
+        printf("-------------------------------\n");
+
+        // sygnalizujemy P2 (sem_2)
+        do {
+            sw = sem_post(sem_2);
+        } while (sw == -1 && errno == EINTR && !g_terminate);
+    }
+
+    printf("[P3] Koncze dzialanie.\n");
+    fflush(stdout);
+    exit(0);
+}
+
+//--------------------------------------------------------
+// main (rodzic)
+//--------------------------------------------------------
+int main() {
+    parentPID = getpid();
+
+    // Usuwanie starych zasobów
+    sem_unlink("/sem_2");
+    sem_unlink("/sem_3");
+    shm_unlink(SHM_NAME);
+    unlink(FIFO_NAME);
+
+    // Kolejki sygnałowe (P1, P2, P3)
+    key_t key_s_p1 = ftok(".", 'X');
+    key_t key_s_p2 = ftok(".", 'Y');
+    key_t key_s_p3 = ftok(".", 'Z');
+    msgidSigP1 = msgget(key_s_p1, 0666 | IPC_CREAT);
+    msgidSigP2 = msgget(key_s_p2, 0666 | IPC_CREAT);
+    msgidSigP3 = msgget(key_s_p3, 0666 | IPC_CREAT);
+    if (msgidSigP1 == -1 || msgidSigP2 == -1 || msgidSigP3 == -1) {
+        report_and_exit("msgget signal error", 1);
+    }
+
+    // Kolejka sygnałowa z P3 do rodzica
+    key_t key_s_parent = ftok(".", 'W');
+    msgidSigParent = msgget(key_s_parent, 0666 | IPC_CREAT);
+    if (msgidSigParent == -1) {
+        report_and_exit("msgget signal-parent error", 1);
+    }
+
+    // Semafory
+    sem_2 = sem_open("/sem_2", O_CREAT | O_EXCL, 0666, 0);
+    sem_3 = sem_open("/sem_3", O_CREAT | O_EXCL, 0666, 0);
+    if (sem_2 == SEM_FAILED || sem_3 == SEM_FAILED) {
+        report_and_exit("sem_open error", 1);
+    }
+
+    // Pamięć dzielona
+    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        report_and_exit("shm_open error", 1);
+    }
+    if (ftruncate(shm_fd, ByteSize) == -1) {
+        report_and_exit("ftruncate error", 1);
+    }
+    char *shared_memory = mmap(NULL, ByteSize, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shared_memory == MAP_FAILED) {
+        report_and_exit("mmap error", 1);
+    }
+
+    // Handler rodzica na SIGUSR1 (od P3)
+    struct sigaction sa_parent;
+    memset(&sa_parent, 0, sizeof(sa_parent));
+    sa_parent.sa_handler = handlerSIGUSR1_parent;
+    sigaction(SIGUSR1, &sa_parent, NULL);
+
+    // Ignoruj inne sygnały w rodzicu (dla przykładu)
+    for (int i=1; i<32; i++) {
+        if (i == SIGKILL || i == SIGSTOP || i == SIGUSR1) continue;
+        signal(i, SIG_IGN);
+    }
+
+    // Tworzenie procesów P1, P2, P3
+    pid1 = fork();
+    if (pid1 == 0) {
+        P1();
+    }
+
+    pid2 = fork();
+    if (pid2 == 0) {
+        P2(shared_memory);
+    }
+
+    pid3 = fork();
+    if (pid3 == 0) {
+        P3(shared_memory);
+    }
+
+    // Rodzic czeka na zakończenie dzieci
+    for (int i=0; i<3; i++) {
+        wait(NULL);
+    }
+
+    // Sprzątanie
+    sem_unlink("/sem_2");
+    sem_unlink("/sem_3");
+    shm_unlink(SHM_NAME);
+
+    msgctl(msgidSigP1, IPC_RMID, NULL);
+    msgctl(msgidSigP2, IPC_RMID, NULL);
+    msgctl(msgidSigP3, IPC_RMID, NULL);
+    msgctl(msgidSigParent, IPC_RMID, NULL);
+
+    printf("[Parent] Wszystkie procesy zakonczone. Zasoby zwolnione.\n");
+    return 0;
+}
