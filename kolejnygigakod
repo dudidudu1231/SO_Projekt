@@ -45,7 +45,7 @@ static int msgid_p3;  // parent <-> P3
 pid_t pid1, pid2, pid3;
 
 // -------------------------------------
-// Semafory i pamięć dzielona (jak poprzednio)
+// Semafory i pamięć dzielona
 // -------------------------------------
 sem_t *sem_2, *sem_3;
 char   buffer[ByteSize];
@@ -85,22 +85,10 @@ void p3_terminal_handler(int sig) {
     // Obudź rodzica (powiadom że coś czeka w kolejce)
     kill(getppid(), SIGUSR1);
 
-    // [POPRAWKA] Usuwamy bezpośrednie raise(SIGTSTP) / raise(SIGCONT).
-    // Chcemy, aby P3 faktycznie wykonał zatrzymanie/wznowienie dopiero,
-    // gdy otrzyma sygnał w łańcuchu od rodzica (w p3_parent_handler).
-    // Dlatego nic dalej tu nie robimy dla SIGTSTP/SIGCONT.
-
-    // Jeśli to np. SIGINT czy SIGTERM z terminala,
-    // można zakończyć *lokalnie* (jeśli tak chcemy).
-    // Na razie – tak jak w oryginale:
-    if (sig == SIGINT) {
-        // ewentualnie NIC tu nie robimy,
-        // bo i tak rodzic roześle łańcuchem.
-    }
-    else if (sig == SIGTERM) {
-        // j.w.
-    }
-    // Pozostałe sygnały – brak akcji.
+    // UWAGA: usunięte raise(SIGTSTP)/raise(SIGCONT),
+    // żeby P3 sam z siebie nie przechodził natychmiast w STOP.
+    // Teraz ewentualne zatrzymanie/wznowienie można zrobić zewnętrznie
+    // komendą kill -SIGTSTP / kill -SIGCONT.
 }
 
 // ********** P3: sygnały od rodzica (łańcuch) **********
@@ -119,16 +107,14 @@ void p3_parent_handler(int sig) {
         exit(0);
     }
     else if (msg.signal == SIGTSTP) {
-        printf("[P3] Zatrzymuję się (SIGTSTP).\n");
-        signal(SIGTSTP, SIG_DFL);
-        raise(SIGTSTP);
+        // Zamiast raise(SIGTSTP), po prostu informujemy
+        printf("[P3] Otrzymałem SIGTSTP w łańcuchu (ignoruję zatrzymanie tu).\n");
     }
     else if (msg.signal == SIGCONT) {
-        printf("[P3] Wznawiam się (SIGCONT).\n");
-        signal(SIGCONT, SIG_DFL);
-        raise(SIGCONT);
+        // Zamiast raise(SIGCONT), tylko informujemy
+        printf("[P3] Otrzymałem SIGCONT w łańcuchu (nie wznawiam tu nic ręcznie).\n");
     }
-    // ... tu można rozwinąć dla SIGINT, itd.
+    // ... tu można rozwinąć dla SIGINT, itp.
 }
 
 // ********** P2: sygnały od rodzica (łańcuch) **********
@@ -150,14 +136,10 @@ void p2_parent_handler(int sig) {
         exit(0);
     }
     else if (msg.signal == SIGTSTP) {
-        printf("[P2] Zatrzymuję się (SIGTSTP).\n");
-        signal(SIGTSTP, SIG_DFL);
-        raise(SIGTSTP);
+        printf("[P2] Otrzymałem SIGTSTP w łańcuchu (ignoruję zatrzymanie tu).\n");
     }
     else if (msg.signal == SIGCONT) {
-        printf("[P2] Wznawiam się (SIGCONT).\n");
-        signal(SIGCONT, SIG_DFL);
-        raise(SIGCONT);
+        printf("[P2] Otrzymałem SIGCONT w łańcuchu (nie wznawiam tu nic ręcznie).\n");
     }
     // ... itd.
 }
@@ -181,22 +163,17 @@ void p1_parent_handler(int sig) {
         exit(0);
     }
     else if (msg.signal == SIGTSTP) {
-        printf("[P1] Zatrzymuję się (SIGTSTP).\n");
-        signal(SIGTSTP, SIG_DFL);
-        raise(SIGTSTP);
+        printf("[P1] Otrzymałem SIGTSTP w łańcuchu (ignoruję zatrzymanie tu).\n");
     }
     else if (msg.signal == SIGCONT) {
-        printf("[P1] Wznawiam się (SIGCONT).\n");
-        signal(SIGCONT, SIG_DFL);
-        raise(SIGCONT);
+        printf("[P1] Otrzymałem SIGCONT w łańcuchu (nie wznawiam tu nic ręcznie).\n");
     }
     // ... itd.
 }
 
 // ********** RODZIC: sygnał SIGUSR1 przychodzi od P3 **********
 void parent_sigusr1_handler(int sig) {
-    // [UWAGA] W praktyce msgrcv w handlerze nie jest async-signal-safe,
-    // ale pozostawiamy to tak, jak w oryginale.
+    // W praktyce msgrcv nie jest async-signal-safe, ale zostawiamy jak w oryginale
 
     // Najpierw odczytujemy z kolejki msgid_p3 (child->parent), mtype=1
     sigmsg_t msg;
@@ -228,7 +205,7 @@ void P1() {
     // Rejestrujemy handler do sygnałów od rodzica (łańcuch)
     signal(SIGUSR1, p1_parent_handler);
 
-    // Ignoruj sygnały z terminala, bo obsługuje je P3 w nowym mechanizmie
+    // Ignoruj sygnały z terminala, bo obsługuje je P3
     signal(SIGINT,  SIG_IGN);
     signal(SIGTERM, SIG_IGN);
     signal(SIGTSTP, SIG_IGN);
@@ -259,7 +236,7 @@ void P1() {
             printf("[P1] Nieprawidlowy wybor.\n");
             continue;
         }
-        // usunięcie reszty linii
+        // Usunięcie reszty linii
         int c; 
         while ((c=getchar())!='\n' && c!=EOF) {}
 
@@ -441,13 +418,13 @@ void P2(char *shared_memory) {
 // ------------------------- KOD PROCESU P3 ------------------------------
 // ----------------------------------------------------------------------
 void P3(char *shared_memory) {
-    // P3 przechwytuje sygnały z terminala:
+    // P3: sygnały z terminala
     signal(SIGINT,  p3_terminal_handler);
     signal(SIGTERM, p3_terminal_handler);
     signal(SIGTSTP, p3_terminal_handler);
     signal(SIGCONT, p3_terminal_handler);
 
-    // 2) Odbiera też sygnały od rodzica (łańcuch)
+    // Odbiera też sygnały od rodzica (łańcuch)
     signal(SIGUSR1, p3_parent_handler);
 
     while (1) {
@@ -473,7 +450,7 @@ void P3(char *shared_memory) {
 
         // Wysyłamy "done" do P1 (aby zwolnić go z msgrcv)
         struct msg_data m;
-        m.msg_type = 1; // cokolwiek, byle =1
+        m.msg_type = 1; 
         strcpy(m.msg_text, "done");
         if (msgsnd(msgid_p3_p1, &m, sizeof(m.msg_text), 0) == -1) {
             perror("[P3] msgsnd p3->p1");
@@ -541,10 +518,13 @@ int main() {
     sa_parent.sa_handler = parent_sigusr1_handler;
     sigaction(SIGUSR1, &sa_parent, NULL);
 
-    // Możemy ignorować np. wszystkie inne sygnały w rodzicu
-    // (żeby tylko P3 je przejmował z terminala)
+    // Możemy ignorować inne sygnały, ale UWAGA – jeśli chcemy móc wstrzymać/wznowić
+    // rodzica z terminala, można usunąć ignorowanie SIGTSTP/SIGCONT tutaj:
     for (int i=1; i<32; i++) {
-        if (i == SIGKILL || i == SIGSTOP || i == SIGUSR1) continue;
+        if (i == SIGKILL || i == SIGSTOP || i == SIGUSR1
+            || i == SIGTSTP || i == SIGCONT) {
+            continue;
+        }
         signal(i, SIG_IGN);
     }
 
