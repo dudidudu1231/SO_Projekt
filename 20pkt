@@ -1,0 +1,451 @@
+#include <fcntl.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <threads.h>
+#include <unistd.h>
+
+#define FIFO_NAME "fifo_p1_p2"
+#define BUFFER_SIZE 256
+#define BLOCK_SIZE 4096
+#define SHM_KEY 1234
+
+#pragma region Structures
+typedef struct {
+  int signal_id;
+  pid_t p1_id;
+  pid_t p2_id;
+  pid_t p3_id;
+
+  int p1_exit;
+  int p2_exit;
+  int p3_exit;
+} SharedMemory;
+#pragma endregion
+
+#pragma region Variables
+pid_t p1, p2, p3;
+
+sem_t *sem_1;
+sem_t *sem_2;
+sem_t *sem_3;
+sem_t *sem_4;
+
+int shm_address;
+SharedMemory *shm_data;
+
+int pipe_fd[2];
+int fd;
+
+int blocked = 0;
+#pragma endregion
+
+#pragma region Helper Functions
+void clearBuffer() {
+  while (getchar() != '\n') {
+    continue;
+  }
+}
+// Function to report program error
+void report_and_exit(const char *msg) {
+  printf("Program napotkal problem!\n");
+  perror(msg);
+  exit(-1);
+}
+
+void handle_exit(int process_number) {
+  switch (process_number) {
+    case 1:
+      close(fd);         // Zamknięcie FIFO
+      unlink(FIFO_NAME); // Usunięcie FIFO
+      break;
+    case 2:
+      close(fd);         // Zamknięcie FIFO
+      close(pipe_fd[1]); // Zamknięcie końca zapisu pipe
+      break;
+    case 3:
+      close(pipe_fd[0]); // Zamknięcie końca odczytu pipe
+      break;
+  }
+  exit(0);
+}
+#pragma endregion
+
+#pragma region External Signal Handler
+// Processing SIGTERM, SIGTSTP, SIGCONT
+void process_external_signal(int sig_id) {
+  printf("P3 [%d]: Otrzymalem zewnetrzny sygnal (%d)\n", getpid(), sig_id);
+
+  // Send signal to PM
+  if (kill(getppid(), SIGUSR1) == -1) {
+    report_and_exit("Failed to send SIGUSR to PM!");
+  }
+  if (kill(getppid(), sig_id) == -1) {
+    report_and_exit("Failed to send signal to PM!");
+  }
+}
+#pragma endregion
+
+#pragma region Internal Signal Handler
+// Processes all PM signals. It should send signal to P1 and signal value in
+// shared memory
+void process_main_signal(int sig_id) {
+  printf("PM [%d]: Otrzymalem sygnal od P3 (%d)\n", getpid(), sig_id);
+
+  shm_data->signal_id = sig_id;
+  shm_data->p1_id = p1;
+  shm_data->p2_id = p2;
+  shm_data->p3_id = p3;
+
+  printf("PM [%d]: Wyslalem sygnal SIGUSR1 do P1\n", getpid());
+  if (kill(p1, SIGUSR1) == -1) {
+    report_and_exit("Failed to send SIGUSR to P1!");
+  }
+
+  // Reseting mask
+  sigset_t blacklist;
+  sigfillset(&blacklist);
+
+  sigdelset(&blacklist, SIGUSR1);
+  sigprocmask(SIG_SETMASK, &blacklist, NULL);
+}
+
+// Processes SIGUSR1 signal sent to PM. It should unblock other signals to be
+// sent to PM
+void process_main_sigusr1() {
+  printf("PM [%d]: Otrzymalem sygnal SIGUSR1 od P3\n", getpid());
+
+  // Unblocking signals for communication
+  sigset_t blacklist;
+  sigfillset(&blacklist);
+
+  sigdelset(&blacklist, SIGTERM);
+  sigdelset(&blacklist, SIGTSTP);
+  sigdelset(&blacklist, SIGCONT);
+  sigdelset(&blacklist, SIGUSR1);
+  sigdelset(&blacklist, SIGUSR2);
+  sigprocmask(SIG_SETMASK, &blacklist, NULL);
+}
+
+// Executing signal on self
+void execute_child_signal(int sig_id, int processNumber) {
+  printf("P%d [%d]: Wykonalem sygnal %d\n", processNumber, getpid(), sig_id);
+  signal(sig_id, SIG_DFL);
+
+  switch (sig_id) {
+  case SIGTSTP:
+    blocked = 1;
+    break;
+  case SIGCONT:
+    blocked = 0;
+    break;
+  case SIGTERM:
+    handle_exit(processNumber);
+  default:
+    break;
+  }
+}
+
+// Process signal by P1/P2/P3
+void process_child_signal(int sig_id) {
+  int process_number = 1;
+  if (getpid() == shm_data->p2_id)
+    process_number = 2;
+  if (getpid() == shm_data->p3_id)
+    process_number = 3;
+
+  if (process_number == 1) {
+    printf("P%d [%d]: Otrzymalem sygnal SIGUSR1 od PM\n", process_number,
+           getpid());
+  } else {
+    printf("P%d [%d]: Otrzymalem sygnal SIGUSR1 od P%d\n", process_number,
+           getpid(), process_number - 1);
+  }
+  printf("P%d [%d]: Otrzymalem z pamieci wspoldzielonej sygnal (%d)\n",
+         process_number, getpid(), shm_data->signal_id);
+
+  if (process_number == 1) {
+    if (kill(shm_data->p2_id, SIGUSR1) == -1) {
+      report_and_exit("Failed to send SIGUSR to P2!");
+    }
+  } else if (process_number == 2) {
+    if (kill(shm_data->p3_id, SIGUSR1) == -1) {
+      report_and_exit("Failed to send SIGUSR to P3!");
+    }
+  }
+
+  execute_child_signal(shm_data->signal_id, process_number);
+}
+#pragma endregion
+
+// Proces 1: Producent - czytanie danych i przesylanie do P2 przez FIFO
+void process1() {
+  char filename[20];
+  char buffer[BUFFER_SIZE];
+  int input;
+  memset(buffer, 0, BUFFER_SIZE);
+
+  // Otwieranie FIFO w trybie zapisu
+  fd = open(FIFO_NAME, O_WRONLY);
+  if (fd == -1) {
+    unlink(FIFO_NAME);
+    report_and_exit("Unable to open fifo (P1)");
+  }
+  // Signal processing
+  sigset_t blacklist;
+  sigfillset(&blacklist);
+
+  sigdelset(&blacklist, SIGUSR1);
+  sigprocmask(SIG_SETMASK, &blacklist, NULL);
+  // Handling of USR signals (send by PM)
+  signal(SIGUSR1, process_child_signal);
+
+  int exit = 0;
+  while (exit == 0) {
+    printf("========MENU========\n");
+    printf("Jak chcesz wczytac dane?\n");
+    printf("1. Z klawiatury\n");
+    printf("2. Z pliku\n");
+    printf("Wybor: ");
+    scanf("%d", &input);
+    getchar();
+
+    switch (input) {
+      case 1:
+        printf("P1 [%d]: Podaj dane wejsciowe:  ", getpid());
+        fgets(buffer, BUFFER_SIZE, stdin);
+        printf("P1 [%d]: Wyslano do P2: %s\n", getpid(), buffer);
+        write(fd, buffer, BUFFER_SIZE); // Zapis danych do FIFO
+        memset(buffer, 0, BUFFER_SIZE);
+        while (blocked != 0);
+        sem_post(sem_2);
+        sem_wait(sem_1);
+        break; 
+      case 2:
+        printf("P1 [%d]: Podaj nazwe pliku: ", getpid());
+        scanf("%s", filename);
+        FILE *fp = fopen(filename, "r");
+        while (fgets(buffer, BUFFER_SIZE, fp)) {
+          printf("P1 [%d]: Wyslano do P2: %s\n", getpid(), buffer);
+          write(fd, buffer, BUFFER_SIZE); // Zapis danych do FIFO
+          memset(buffer, 0, BUFFER_SIZE);
+          while (blocked != 0);
+          sem_post(sem_2);
+          sem_wait(sem_1);
+        }
+        fclose(fp);
+        break;
+      default:
+        printf("P1 [%d]: Niepoprawna opcja.", getpid());
+        exit = 1;
+        break;
+    }
+  }
+
+  close(fd);         // Zamknięcie FIFO
+  unlink(FIFO_NAME); // Usunięcie FIFO
+}
+
+// Proces 2: Konsument/Producent - odczyt z FIFO, obliczenie długości linii i
+// przesłanie do P3 przez pipe
+void process2() {
+  // Signal processing
+  sigset_t blacklist;
+  sigfillset(&blacklist);
+
+  sigdelset(&blacklist, SIGUSR1);
+  sigprocmask(SIG_SETMASK, &blacklist, NULL);
+  // Handling of USR signals (send by P1)
+  signal(SIGUSR1, process_child_signal);
+
+  char buffer[BUFFER_SIZE] = {0};
+  char output[BUFFER_SIZE] = {0};
+  int length;
+
+  // Otwieranie FIFO w trybie odczytu
+  fd = open(FIFO_NAME, O_RDONLY);
+  if (fd == -1)
+    report_and_exit("Unable to open fifo (P2)!");
+
+  // Zamknięcie nieużywanego końca zapisu pipe
+  close(pipe_fd[0]);
+
+  // Odczytywanie danych z FIFO i przetwarzanie
+  while (1) {
+    sem_wait(sem_2);
+    if (read(fd, buffer, BUFFER_SIZE) > 0) {
+      length = strlen(buffer);
+      if (length > 0 && buffer[length - 1] == '\n')
+        buffer[length - 1] = '\0'; // Usunięcie znaku nowej linii
+      length = strlen(buffer);
+
+      printf("P2 [%d]: Odczytano: %s\n", getpid(), buffer);
+
+      // Tworzenie wyniku w postaci "wiersz: długość"
+      snprintf(output, BUFFER_SIZE, "%s %d\n", buffer, length);
+
+      // Zapis do pipe
+      printf("P2 [%d]: Wyslano do P3: %s\n", getpid(), output);
+      write(pipe_fd[1], output, strlen(output));
+      memset(buffer, 0, BUFFER_SIZE); // Wyczyszczenie bufora
+      memset(output, 0, BUFFER_SIZE);
+      while (blocked != 0);
+      sem_post(sem_3);
+    }
+  }
+
+  close(fd);         // Zamknięcie FIFO
+  close(pipe_fd[1]); // Zamknięcie końca zapisu pipe
+}
+
+// Proces 3: Konsument - odczyt danych z pipe i wyświetlenie w standardowym
+// wyjściu
+void process3() {
+  // Setting signal mask to work only with desired signals
+  sigset_t blacklist;
+  sigfillset(&blacklist);
+
+  sigdelset(&blacklist, SIGTERM);
+  sigdelset(&blacklist, SIGTSTP);
+  sigdelset(&blacklist, SIGCONT);
+  sigdelset(&blacklist, SIGUSR1);
+  sigdelset(&blacklist, SIGUSR2);
+  sigprocmask(SIG_SETMASK, &blacklist, NULL);
+  // Handling of USR signals (send by P2)
+  signal(SIGUSR1, process_child_signal);
+
+  // Handling of OTHER signals (external sender)
+  signal(SIGTERM, process_external_signal);
+  signal(SIGCONT, process_external_signal);
+  signal(SIGTSTP, process_external_signal);
+
+  char buffer[BUFFER_SIZE];
+
+  // Zamknięcie nieużywanego końca zapisu pipe
+  close(pipe_fd[1]);
+
+  // Odczyt danych z pipe i wyświetlanie
+  while (1) {
+    sem_wait(sem_3);
+    if (read(pipe_fd[0], buffer, BUFFER_SIZE) > 0) {
+      printf("P3 [%d]: %s\n", getpid(), buffer);
+      while (blocked != 0);
+      sem_post(sem_1);
+      memset(buffer, 0, BUFFER_SIZE);
+    }
+  }
+
+  close(pipe_fd[0]); // Zamknięcie końca odczytu pipe
+}
+
+int main() {
+  sem_unlink("semaphore1");
+  sem_unlink("semaphore2");
+  sem_unlink("semaphore3");
+  sem_close(sem_1);
+  sem_close(sem_2);
+  sem_close(sem_3);
+
+  // Fifo creation
+  if (mkfifo(FIFO_NAME, 0666) == -1) {
+    perror("mkfifo error");
+    return 0;
+  }
+
+  // Semaphores
+  sem_1 = sem_open("semaphore1", O_CREAT | O_EXCL, 0666, 0);
+  sem_2 = sem_open("semaphore2", O_CREAT | O_EXCL, 0666, 0);
+  sem_3 = sem_open("semaphore3", O_CREAT | O_EXCL, 0666, 0);
+
+  // Shared memory
+  if ((shm_address = shmget(SHM_KEY, sizeof(SharedMemory), IPC_CREAT | 0666)) ==
+      -1) {
+    report_and_exit("Unable to create shared memory!");
+  }
+
+  if ((shm_data = (SharedMemory *)shmat(shm_address, NULL, 0)) == -1) {
+    report_and_exit("Unable to join shared memory!");
+  }
+  // Default
+  shm_data->signal_id = 0;
+
+  // PIPE creation
+  if (pipe(pipe_fd) == -1)
+    report_and_exit("Unable to create pipe!");
+
+  // Processes creation
+  switch (p1 = fork()) {
+  case 0:
+    process1();
+    exit(0);
+    break;
+  case -1:
+    report_and_exit("Unable to fork (P1)!");
+    break;
+  default:
+    switch (p2 = fork()) {
+    case 0:
+      process2();
+      exit(0);
+      break;
+    case -1:
+      report_and_exit("Unable to fork (P2)!");
+      break;
+    default:
+      switch (p3 = fork()) {
+      case 0:
+        process3();
+        exit(0);
+        break;
+      case -1:
+        report_and_exit("Unable to fork (P3)!");
+        break;
+      default:
+        // Blocking all signals except SIGUSER1
+        sigset_t blacklist;
+        sigfillset(&blacklist);
+
+        sigdelset(&blacklist, SIGUSR1);
+        sigprocmask(SIG_SETMASK, &blacklist, NULL);
+
+        // Processing signals
+        signal(SIGUSR1, process_main_sigusr1);
+        signal(SIGTERM, process_main_signal);
+        signal(SIGCONT, process_main_signal);
+        signal(SIGTSTP, process_main_signal);
+        break;
+      }
+      break;
+    }
+    break;
+  }
+
+  // Oczekiwanie na zakończenie procesów potomnych
+  waitpid(p2, NULL, 0);
+  waitpid(p3, NULL, 0);
+  waitpid(p1, NULL, 0);
+
+  sem_unlink("semaphore1");
+  sem_unlink("semaphore2");
+  sem_unlink("semaphore3");
+  sem_close(sem_1);
+  sem_close(sem_2);
+  sem_close(sem_3);
+
+  // Detaching memory block
+  shmdt(shm_data);
+  // Destroying memory block
+  shmctl(shm_address, IPC_RMID, NULL);
+
+  printf("PM [%d]: Zakonczono dzialanie programu!\n", getpid());
+
+  return 0;
+}
