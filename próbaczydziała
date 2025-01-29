@@ -1,10 +1,28 @@
+
 #include <stdio.h>
 #include <stdlib.h>
-#include <signal.h>
-#include <sys/types.h>
-#include <sys/ipc.h>
-#include <sys/msg.h>
+#include <string.h>
+#include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <semaphore.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <sys/msg.h>
+#include <sys/ipc.h>
+
+#define FIFO_NAME   "/home/filip/skrypty_shellowe/projekt/my_fifo"
+#define ByteSize    256
+#define SHM_NAME    "/shared_memory"
+
+struct msg_data {
+    long msg_type;
+    char msg_text[20];
+};
+int msgid_p3_p1;  //do przesylania "done"
 
 // Struktura dla kolejki komunikatów
 typedef struct {
@@ -106,6 +124,254 @@ void P2_signal_init() {
 void P3_signal_init() {
     signal(SIGUSR1, p3_signal_handler);
 }
+sem_t *sem_2, *sem_3;
+char   buffer[ByteSize];
+
+//prosta funkcja bledu
+void report_and_exit(const char *msg, int exit_code) {
+    perror(msg);
+    exit(exit_code);
+}
+
+//liczenie znaków (bez \n i \r)
+int zlicz_znaki(const char *str) {
+    int count = 0;
+    for (int i = 0; str[i] != '\0'; i++) {
+        if (str[i] != '\n' && str[i] != '\r')
+            count++;
+    }
+    return count;
+}
+
+void P1() {
+    //rejestrujemy nowe handlery
+    P1_signal_init();
+
+    //tworzymy FIFO do zapisu
+    unlink(FIFO_NAME);
+    if (mkfifo(FIFO_NAME, 0666) == -1 && errno != EEXIST) {
+        report_and_exit("mkfifo (P1) error", 1);
+    }
+    int fd = open(FIFO_NAME, O_WRONLY);
+    if (fd < 0) {
+        report_and_exit("open FIFO (P1) error", 1);
+    }
+
+    while (1) {
+        printf("\n[P1] Menu:\n");
+        printf("1. Czytaj z klawiatury (koniec: '.')\n");
+        printf("2. Czytaj z pliku (do EOF)\n");
+        printf("Wybierz opcje: ");
+        fflush(stdout);
+
+        int choice;
+        if (scanf("%d", &choice) != 1) {
+            //czyszczenie bufora
+            int c; 
+            while ((c = getchar()) != '\n' && c != EOF) {}
+            printf("[P1] Nieprawidlowy wybor.\n");
+            continue;
+        }
+        //usuniecie reszty linii
+        int c; 
+        while ((c=getchar())!='\n' && c!=EOF) {}
+
+        if (choice == 1) {
+            while (1) {
+                printf("[P1] Wpisz tekst ('.' konczy): ");
+                fflush(stdout);
+
+                if (!fgets(buffer, ByteSize, stdin)) {
+                    if (feof(stdin)) {
+                        printf("[P1] EOF na stdin.\n");
+                    } else {
+                        perror("[P1] Blad odczytu stdin");
+                    }
+                    break;
+                }
+                buffer[strcspn(buffer, "\n")] = '\0';
+
+                if (strcmp(buffer, ".") == 0) {
+                    printf("[P1] Koniec wczytywania z klawiatury.\n");
+                    break;
+                }
+
+                //dodaj '\n' na koncu, zeby P2 widzial koniec linii
+                size_t len = strlen(buffer);
+                buffer[len]   = '\n';
+                buffer[len+1] = '\0';
+
+                ssize_t wret;
+                do {
+                    wret = write(fd, buffer, len+1);
+                } while (wret == -1 && errno == EINTR);
+                if (wret < 0) {
+                    perror("[P1] write FIFO error");
+                    break;
+                }
+
+                //czekamy na "done" od P3 (kolejka msgid_p3_p1)
+                struct msg_data m;
+                if (msgrcv(msgid_p3_p1, &m, sizeof(m.msg_text), 1, 0) == -1) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    perror("[P1] msgrcv p3->p1");
+                    break;
+                }
+            }
+        }
+        else if (choice == 2) {
+            char filename[256];
+            printf("[P1] Podaj nazwe pliku: ");
+            fflush(stdout);
+            if (!fgets(filename, sizeof(filename), stdin)) {
+                fprintf(stderr, "[P1] Blad odczytu nazwy pliku.\n");
+                continue;
+            }
+            filename[strcspn(filename, "\n")] = '\0';
+
+            FILE *file = fopen(filename, "r");
+            if (!file) {
+                perror("[P1] Nie mozna otworzyc pliku");
+                continue;
+            }
+
+            while (1) {
+                char *p = fgets(buffer, ByteSize, file);
+                if (!p) {
+                    if (!feof(file)) {
+                        perror("[P1] blad odczytu pliku");
+                    }
+                    printf("[P1] Koniec pliku.\n");
+                    break;
+                }
+                printf("[P1] Wczytano z pliku: %s", buffer);
+
+                size_t toWrite = strlen(buffer);
+                ssize_t wret;
+                do {
+                    wret = write(fd, buffer, toWrite);
+                } while (wret == -1 && errno == EINTR);
+                if (wret < 0) {
+                    perror("[P1] write FIFO error");
+                    break;
+                }
+
+                //oczekiwanie na "done" od P3
+                struct msg_data m;
+                if (msgrcv(msgid_p3_p1, &m, sizeof(m.msg_text), 1, 0) == -1) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    perror("[P1] msgrcv p3->p1");
+                    break;
+                }
+            }
+            fclose(file);
+        }
+        else {
+            printf("[P1] Nieprawidlowy wybor.\n");
+        }
+    }
+
+    close(fd);
+    printf("[P1] Koncze dzialanie.\n");
+    fflush(stdout);
+    exit(0);
+}
+
+void P2(char *shared_memory) {
+    //nowe handlery (SIGUSR2 od P1 itd.)
+    P2_signal_init();
+
+    int fd = open(FIFO_NAME, O_RDONLY);
+    if (fd < 0) {
+        report_and_exit("open FIFO (P2) error", 1);
+    }
+    FILE *f = fdopen(fd, "r");
+    if (!f) {
+        report_and_exit("fdopen (P2) error", 1);
+    }
+
+    while (1) {
+        //odczyt jednej linii z FIFO
+        char *res = fgets(buffer, ByteSize, f);
+        if (!res) {
+            if (feof(f)) {
+                printf("[P2] Koniec FIFO (EOF)\n");
+            } else {
+                perror("[P2] fgets FIFO error");
+            }
+            break;
+        }
+        printf("[P2] Dane odczytane z FIFO: %s", buffer);
+
+        int ilosc = zlicz_znaki(buffer);
+        sprintf(shared_memory, "%d", ilosc);
+        printf("[P2] Ilosc znakow: %d => przekazuje do P3\n", ilosc);
+
+        //poinformuj P3: sem_post(sem_3)
+        if (sem_post(sem_3) == -1) {
+            if (errno != EINTR) {
+                perror("[P2] sem_post(sem_3)");
+                break;
+            }
+        }
+
+        //czekanie, az P3 skonczy -> sem_wait(sem_2)
+        if (sem_wait(sem_2) == -1) {
+            if (errno != EINTR) {
+                perror("[P2] sem_wait(sem_2)");
+                break;
+            }
+        }
+    }
+
+    fclose(f);
+    printf("[P2] Koncze dzialanie.\n");
+    fflush(stdout);
+    exit(0);
+}
+
+void P3(char *shared_memory) {
+    //rejestracja przechwytywania SIGTERM, SIGTSTP, SIGCONT
+    P3_signal_init();
+
+    while (1) {
+        //czekamy na sem_3 od P2
+        if (sem_wait(sem_3) == -1) {
+            if (errno != EINTR) {
+                perror("[P3] sem_wait(sem_3)");
+                break;
+            }
+        }
+
+        printf("[P3] Dane odczytane z PD: %s\n", shared_memory);
+        printf("-------------------------------\n");
+
+        //sygnalizowanie P2 (sem_2)
+        if (sem_post(sem_2) == -1) {
+            if (errno != EINTR) {
+                perror("[P3] sem_post(sem_2)");
+                break;
+            }
+        }
+
+        //wysylamy "done" do P1
+        struct msg_data m;
+        m.msg_type = 1;
+        strcpy(m.msg_text, "done");
+        if (msgsnd(msgid_p3_p1, &m, sizeof(m.msg_text), 0) == -1) {
+            perror("[P3] msgsnd p3->p1");
+        }
+    }
+
+    printf("[P3] Koncze dzialanie.\n");
+    fflush(stdout);
+    exit(0);
+}
+
 
 int main() {
     // Czyszczenie zasobów
@@ -125,7 +391,7 @@ int main() {
     if (msgid_p1 == -1 || msgid_p2 == -1 || msgid_p3 == -1) {
         report_and_exit("msgget error", 1);
     }
-    
+    int msgsignal;
     msgsignal = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
     if (msgsignal < 0) {
         report_and_exit("msgget (IPC_PRIVATE) error", 1);
