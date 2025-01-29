@@ -6,14 +6,14 @@
 #include <sys/msg.h>
 #include <errno.h>
 
-#define PROJECT_ID 123
+#define klientserwer 123
 #define M_DANE 1
 #define M_KONIEC 2
 #define M_WYNIK 3
 
 struct message {
     long mtype;
-    int value;
+    int wartosc;
 };
 
 int main(int argc, char *argv[]) {
@@ -29,7 +29,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Create or get message queue
-    key_t key = ftok(".", PROJECT_ID);
+    key_t key = ftok(".", klientserwer);
     if (key == -1) {
         perror("ftok error");
         exit(1);
@@ -47,7 +47,7 @@ int main(int argc, char *argv[]) {
     // Send numbers
     for (i = 0; i < count - 1; i++) {
         printf("Podaj %d. liczbe: ", i + 1);
-        scanf("%d", &msg.value);
+        scanf("%d", &msg.wartosc);
         msg.mtype = M_DANE;
 
         if (msgsnd(msqid, &msg, sizeof(int), 0) == -1) {
@@ -58,7 +58,7 @@ int main(int argc, char *argv[]) {
 
     // Send last number with M_KONIEC
     printf("Podaj %d. liczbe: ", count);
-    scanf("%d", &msg.value);
+    scanf("%d", &msg.wartosc);
     msg.mtype = M_KONIEC;
 
     if (msgsnd(msqid, &msg, sizeof(int), 0) == -1) {
@@ -72,7 +72,7 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    printf("Otrzymano wynik: %d\n", msg.value);
+    printf("Otrzymano wynik: %d\n", msg.wartosc);
 
     return 0;
 }
