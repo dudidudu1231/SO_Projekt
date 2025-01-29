@@ -1,0 +1,19 @@
+Napisac programy klienta i erwera realizujace scenaroiusz Serwer sumuje liczby wysylane przez klienta. Liczby sa przesylane jako komunikat typu M_Dane, a ostatnia z liczb jest wysylana jako komunikat M_Koniec. Po ottrzymanoi tego komunikatu serwer odsyla wynik sumowania komunikatem typu m_wynik.
+
+Zalozenia
+	- Wykorzystanie funkvji biblioteki sys/msg.h : msgget, msgsnd, msgrcv, msgctl
+	- Zakaz uzywanaia funkcji typu sleep
+	- Przezd zakonczeniem programu wszystkie struktruy w kazdym procesie należy zamknac
+./klient 4
+Podaj1. liczbe : 5
+.
+.
+.
+Podaj 4. liczbe: -45
+Otrzymano wynik: ….
+./serwer 
+Odczytano komunikat M_DANE o wartosci: 5
+.
+..
+Odczytano komunikat M_KONIEC O WARTOSCI: -45
+Wyslano komunikat M_wynik: …
