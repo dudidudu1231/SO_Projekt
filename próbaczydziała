@@ -108,29 +108,91 @@ void P3_signal_init() {
 }
 
 int main() {
-    key_t key1 = ftok("p1", 65);
-    key_t key2 = ftok("p2", 66);
-    key_t key3 = ftok("p3", 67);
+    // Czyszczenie zasobów
+    sem_unlink("/sem_2");
+    sem_unlink("/sem_3");
+    shm_unlink(SHM_NAME);
+    
+    // Kolejki komunikatów
+    key_t key1 = ftok(".", 'A');
+    key_t key2 = ftok(".", 'B');
+    key_t key3 = ftok(".", 'C');
     
     msgid_p1 = msgget(key1, 0666 | IPC_CREAT);
     msgid_p2 = msgget(key2, 0666 | IPC_CREAT);
     msgid_p3 = msgget(key3, 0666 | IPC_CREAT);
     
+    if (msgid_p1 == -1 || msgid_p2 == -1 || msgid_p3 == -1) {
+        report_and_exit("msgget error", 1);
+    }
+    
+    msgsignal = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
+    if (msgsignal < 0) {
+        report_and_exit("msgget (IPC_PRIVATE) error", 1);
+    }
+
+    // Semafory
+    sem_2 = sem_open("/sem_2", O_CREAT | O_EXCL, 0666, 0);
+    sem_3 = sem_open("/sem_3", O_CREAT | O_EXCL, 0666, 0);
+    if (sem_2 == SEM_FAILED || sem_3 == SEM_FAILED) {
+        report_and_exit("sem_open error", 1);
+    }
+
+    // Pamięć współdzielona
+    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        report_and_exit("shm_open error", 1);
+    }
+    if (ftruncate(shm_fd, ByteSize) == -1) {
+        report_and_exit("ftruncate error", 1);
+    }
+    char *shared_memory = mmap(NULL, ByteSize, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shared_memory == MAP_FAILED) {
+        report_and_exit("mmap error", 1);
+    }
+
+    // Rejestracja handlera sygnałów w rodzicu
+    struct sigaction sa_parent;
+    memset(&sa_parent, 0, sizeof(sa_parent));
+    sa_parent.sa_handler = parent_signal_handler;
+    sigaction(SIGUSR1, &sa_parent, NULL);
+
+    // Ignorowanie innych sygnałów w rodzicu
+    for (int i = 1; i < 32; i++) {
+        if (i == SIGKILL || i == SIGSTOP || i == SIGUSR1) continue;
+        signal(i, SIG_IGN);
+    }
+
+    // Tworzenie procesów
     if ((pid1 = fork()) == 0) {
         P1_signal_init();
         while (1) pause();
     }
-    else if ((pid2 = fork()) == 0) {
+    
+    if ((pid2 = fork()) == 0) {
         P2_signal_init();
         while (1) pause();
     }
-    else if ((pid3 = fork()) == 0) {
+    
+    if ((pid3 = fork()) == 0) {
         P3_signal_init();
         while (1) pause();
     }
-    else {
-        signal(SIGUSR1, parent_signal_handler);
-        while (1) pause();
+    
+    // Rodzic czeka na zakończenie dzieci
+    for (int i = 0; i < 3; i++) {
+        wait(NULL);
     }
+
+    // Sprzątanie zasobów
+    sem_unlink("/sem_2");
+    sem_unlink("/sem_3");
+    shm_unlink(SHM_NAME);
+    msgctl(msgid_p1, IPC_RMID, NULL);
+    msgctl(msgid_p2, IPC_RMID, NULL);
+    msgctl(msgid_p3, IPC_RMID, NULL);
+    msgctl(msgsignal, IPC_RMID, NULL);
+
+    printf("[Parent] Wszystkie procesy zakończone. Zasoby zwolnione.\n");
     return 0;
 }
