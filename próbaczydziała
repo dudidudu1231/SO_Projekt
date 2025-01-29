@@ -383,12 +383,12 @@ int main() {
     key_t key1 = ftok(".", 'A');
     key_t key2 = ftok(".", 'B');
     key_t key3 = ftok(".", 'C');
-    key_t key3_1 = ftok(".", 'C');
+    key_t key3_p1 = ftok(".", 'D');
     
     msgid_p1 = msgget(key1, 0666 | IPC_CREAT);
     msgid_p2 = msgget(key2, 0666 | IPC_CREAT);
     msgid_p3 = msgget(key3, 0666 | IPC_CREAT);
-    msgid_p3_p1 = msgget(key3, 0666 | IPC_CREAT);
+    msgid_p3_p1 = msgget(key3_p1, 0666 | IPC_CREAT);
 
     if (msgid_p1 == -1 || msgid_p2 == -1 || msgid_p3 == -1) {
         report_and_exit("msgget error", 1);
@@ -436,21 +436,21 @@ int main() {
 
     // Tworzenie procesów
     if ((pid1 = fork()) == 0) {
-        P1();
         P1_signal_init();
-        while (1) pause();
+        P1();
+       exit(0);
     }
     
     if ((pid2 = fork()) == 0) {
-        P2(shared_memory);
         P2_signal_init();
-        while (1) pause();
+        P2(shared_memory);
+       exit(0);
     }
     
     if ((pid3 = fork()) == 0) {
-        P3(shared_memory);
         P3_signal_init();
-        while (1) pause();
+        P3(shared_memory);
+      exit(0);
     }
     
     // Rodzic czeka na zakończenie dzieci
