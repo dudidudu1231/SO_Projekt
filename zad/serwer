@@ -6,19 +6,19 @@
 #include <sys/msg.h>
 #include <errno.h>
 
-#define PROJECT_ID 123
+#define klientserwer 123
 #define M_DANE 1
 #define M_KONIEC 2
 #define M_WYNIK 3
 
 struct message {
     long mtype;
-    int value;
+    int wartosc;
 };
 
 int main() {
     // Create message queue
-    key_t key = ftok(".", PROJECT_ID);
+    key_t key = ftok(".", klientserwer);
     if (key == -1) {
         perror("ftok error");
         exit(1);
@@ -42,18 +42,18 @@ int main() {
         }
 
         if (msg.mtype == M_DANE) {
-            printf("Odczytano komunikat M_DANE o wartosci: %d\n", msg.value);
-            sum += msg.value;
+            printf("Odczytano komunikat M_DANE o wartosci: %d\n", msg.wartosc);
+            sum += msg.wartosc;
         } else if (msg.mtype == M_KONIEC) {
-            printf("Odczytano komunikat M_KONIEC o wartosci: %d\n", msg.value);
-            sum += msg.value;
+            printf("Odczytano komunikat M_KONIEC o wartosci: %d\n", msg.wartosc);
+            sum += msg.wartosc;
             running = 0;
         }
     }
 
     // Send result
     msg.mtype = M_WYNIK;
-    msg.value = sum;
+    msg.wartosc = sum;
     printf("Wyslano komunikat M_WYNIK: %d\n", sum);
 
     if (msgsnd(msqid, &msg, sizeof(int), 0) == -1) {
