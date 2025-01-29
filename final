@@ -21,13 +21,13 @@ struct msg_data {
     long msg_type;
     char msg_text[20];
 };
-int msgid_p3_p1;  // do przesylania "done"
+int msgid_p3_p1;  //do przesylania "done"
 
 //struktura do wysylania sygnalow do rodzica:
 typedef struct {
     long mtype;
     int  signal;
-} msgbuf;
+} msgsig;
 
 int msgq_id; //jedna kolejka do sygnalow
 volatile sig_atomic_t paused = 0; //flaga 
@@ -37,7 +37,7 @@ pid_t pid1, pid2, pid3;
 
 //handler rodzica, wywolywany gdy dostanie SIGUSR1 od P3
 void parent_sigusr1_handler(int sig) {
-    msgbuf msg;
+    msgsig msg;
     if (msgrcv(msgq_id, &msg, sizeof(int), 1, 0) == -1) {
         perror("[PARENT] msgrcv error");
         return;
@@ -72,7 +72,7 @@ void p3_signal_handler(int sig) {
     printf("[P3, PID=%d] Otrzymałem sygnał %d\n", getpid(), sig);
 
     //tworzymy komunikat do rodzica
-    msgbuf msg;
+    msgsig msg;
     msg.mtype  = 1;
     msg.signal = sig;
 
@@ -97,7 +97,7 @@ void p1_signal_handler(int sig) {
     printf("[P1, PID=%d] Odebrałem powiadomienie od rodzica\n", getpid());
 
     //odczyt komunikatu mtype=2 (co rodzic wlasnie wyslal)
-    msgbuf msg;
+    msgsig msg;
     if (msgrcv(msgq_id, &msg, sizeof(int), 2, 0) == -1) {
         perror("[P1] msgrcv error (mtype=2)");
         return;
