@@ -1,0 +1,521 @@
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <semaphore.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <sys/msg.h>
+
+// ***********************************************
+// *** USTAWIENIA STAŁE, STRUKTURA I KOLEJKA "DONE"
+// ***********************************************
+
+#define FIFO_NAME   "/home/maciek/Documents/CPrograms/projekt/my_fifo"
+#define ByteSize    256
+#define SHM_NAME    "/shared_memory"
+
+// Kolejka dla "done" (P3 -> P1)
+struct msg_data {
+    long msg_type;
+    char msg_text[20];
+};
+int msgid_p3_p1;  // do przesyłania "done"
+
+
+// ***********************************************
+// ******** Nowy mechanizm powiadamiania *********
+// ****** (zastępuje stary łańcuch SIGUSR1) ******
+// ***********************************************
+//
+// Struktura do wysyłania sygnałów do rodzica:
+typedef struct {
+    long mtype; // 1 = od P3 do rodzica, 2 = od rodzica do P1
+    int  signal;
+} msgbuf;
+
+static int msgq_id;                 // jedna kolejka do sygnałów
+static volatile sig_atomic_t paused = 0; // flaga tylko w rodzicu (podgląd)
+
+// PID-y procesów potomnych
+pid_t pid1, pid2, pid3;
+
+// Prosta funkcja sprzątająca (w razie potrzeby):
+void cleanup_resources() {
+    // Usunięcie kolejki do powiadomień sygnałowych
+    if (msgq_id >= 0) {
+        msgctl(msgq_id, IPC_RMID, NULL);
+    }
+    // Usunięcie kolejki "done" p3->p1
+    msgctl(msgid_p3_p1, IPC_RMID, NULL);
+    // Można tu dołożyć inne rzeczy (ale w main jest też sprzątanie).
+}
+
+// Handler rodzica, wywoływany gdy dostanie SIGUSR1 od P3
+void parent_sigusr1_handler(int sig) {
+    msgbuf msg;
+    // Odczyt z kolejki mtype=1 (co wysłał P3)
+    if (msgrcv(msgq_id, &msg, sizeof(int), 1, 0) == -1) {
+        perror("[PARENT] msgrcv error");
+        return;
+    }
+    int received_signal = msg.signal;
+    printf("[PARENT] Otrzymałem sygnał %d od P3\n", received_signal);
+
+    if (received_signal == SIGTSTP) {
+        printf("[PARENT] Wysyłam SIGSTOP do P1 i P2\n");
+        kill(pid1, SIGSTOP);
+        kill(pid2, SIGSTOP);
+        paused = 1;
+    }
+    else if (received_signal == SIGCONT) {
+        printf("[PARENT] Wysyłam SIGCONT do P1 i P2\n");
+        kill(pid1, SIGCONT);
+        kill(pid2, SIGCONT);
+        paused = 0;
+    }
+    else {
+        // Np. SIGTERM, SIGINT - tutaj wstawiamy logikę łańcucha: P1 -> P2
+        // Najpierw wyślemy do kolejki mtype=2 i sygnał, potem SIGUSR1 do P1
+        msg.mtype = 2;
+        if (msgsnd(msgq_id, &msg, sizeof(int), 0) == -1) {
+            perror("[PARENT] msgsnd error (mtype=2)");
+        }
+        printf("[PARENT] Przekazuję dalej sygnał %d (mtype=2) -> P1\n", received_signal);
+        kill(pid1, SIGUSR1);
+    }
+}
+
+// Handler P3 – przechwytuje SIGINT, SIGTERM, SIGTSTP, SIGCONT
+static void p3_signal_handler(int sig) {
+    printf("[P3, PID=%d] Otrzymałem sygnał %d\n", getpid(), sig);
+
+    // Tworzymy komunikat do rodzica
+    msgbuf msg;
+    msg.mtype  = 1;    // 1 = od P3 do rodzica
+    msg.signal = sig;
+
+    // Wysyłamy do kolejki
+    if (msgsnd(msgq_id, &msg, sizeof(int), 0) == -1) {
+        perror("[P3] msgsnd error (do rodzica)");
+    }
+
+    printf("[P3, PID=%d] Przekazuję sygnał %d rodzicowi (SIGUSR1)\n", getpid(), sig);
+    kill(getppid(), SIGUSR1);
+
+    // Jeśli to SIGTSTP albo SIGCONT, w tym mechanizmie przywracamy domyślną obsługę
+    // i natychmiast podnosimy sygnał, żeby faktycznie zatrzymał/wznowił ten proces.
+    // (Tak było w kodzie #2)
+    if (sig == SIGTSTP || sig == SIGCONT) {
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+}
+
+// Handler P1 – wywoływany, gdy P1 dostanie SIGUSR1 od rodzica
+static void p1_signal_handler(int sig) {
+    printf("[P1, PID=%d] Odebrałem powiadomienie od rodzica\n", getpid());
+
+    // Odczyt komunikatu mtype=2 (co rodzic właśnie wysłał)
+    msgbuf msg;
+    if (msgrcv(msgq_id, &msg, sizeof(int), 2, 0) == -1) {
+        perror("[P1] msgrcv error (mtype=2)");
+        return;
+    }
+    printf("[P1, PID=%d] Przekazuję dalej sygnał %d -> P2 (SIGUSR2)\n", getpid(), msg.signal);
+    kill(pid2, SIGUSR2);
+
+    // Jeśli chcemy, możemy tu dodać logikę:
+    //   jeśli msg.signal == SIGTERM || SIGINT => p1 kończy
+    //   np. exit(0);
+}
+
+// Handler P2 – wywoływany, gdy P2 dostanie SIGUSR2 od P1
+static void p2_signal_handler(int sig) {
+    printf("[P2, PID=%d] Odebrałem powiadomienie od P1 (SIGUSR2)\n", getpid());
+    // Analogicznie – można tu dodać logikę kończenia, jeśli sygnał to SIGTERM itp.
+}
+
+// Funkcje rejestrujące obsługę sygnałów w P1, P2, P3 (zamiast starego łańcucha)
+static void p1_signals(void) {
+    signal(SIGUSR1, p1_signal_handler);
+    // Ignorujemy np. SIGINT/SIGTERM/SIGTSTP/SIGCONT,
+    // bo i tak je obsługuje nowy mechanizm łańcuchowy.
+    signal(SIGINT,  SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+    signal(SIGCONT, SIG_IGN);
+}
+
+static void p2_signals(void) {
+    signal(SIGUSR2, p2_signal_handler);
+    signal(SIGINT,  SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+    signal(SIGCONT, SIG_IGN);
+}
+
+static void p3_signals(void) {
+    // P3 nasłuchuje sygnałów i obsługuje w p3_signal_handler
+    signal(SIGINT,  p3_signal_handler);
+    signal(SIGTERM, p3_signal_handler);
+    signal(SIGTSTP, p3_signal_handler);
+    signal(SIGCONT, p3_signal_handler);
+}
+
+
+// ***********************************************
+// ************ Kod wspólny (jak w #1) ***********
+// ****** (FIFO, semafory, pamięć dzielona) ******
+// ***********************************************
+
+sem_t *sem_2, *sem_3;
+char   buffer[ByteSize];
+
+// Prosta funkcja błędu
+void report_and_exit(const char *msg, int exit_code) {
+    perror(msg);
+    exit(exit_code);
+}
+
+// Liczenie znaków (bez \n i \r)
+int zlicz_znaki(const char *str) {
+    int count = 0;
+    for (int i = 0; str[i] != '\0'; i++) {
+        if (str[i] != '\n' && str[i] != '\r')
+            count++;
+    }
+    return count;
+}
+
+// ----- P1 -----
+void P1() {
+    // Rejestrujemy nowe handlery (zamiast starego łańcucha)
+    p1_signals();
+
+    // Tworzymy FIFO do zapisu
+    unlink(FIFO_NAME);
+    if (mkfifo(FIFO_NAME, 0666) == -1 && errno != EEXIST) {
+        report_and_exit("mkfifo (P1) error", 1);
+    }
+    int fd = open(FIFO_NAME, O_WRONLY);
+    if (fd < 0) {
+        report_and_exit("open FIFO (P1) error", 1);
+    }
+
+    while (1) {
+        printf("\n[P1] Menu:\n");
+        printf("1. Czytaj z klawiatury (koniec: '.')\n");
+        printf("2. Czytaj z pliku (do EOF)\n");
+        printf("Wybierz opcje: ");
+        fflush(stdout);
+
+        int choice;
+        if (scanf("%d", &choice) != 1) {
+            // czyszczenie bufora
+            int c; while ((c = getchar()) != '\n' && c != EOF) {}
+            printf("[P1] Nieprawidlowy wybor.\n");
+            continue;
+        }
+        // usunięcie reszty linii
+        int c; while ((c=getchar())!='\n' && c!=EOF) {}
+
+        if (choice == 1) {
+            // --- Czytanie z klawiatury ---
+            while (1) {
+                printf("[P1] Wpisz tekst ('.' konczy): ");
+                fflush(stdout);
+
+                if (!fgets(buffer, ByteSize, stdin)) {
+                    if (feof(stdin)) {
+                        printf("[P1] EOF na stdin.\n");
+                    } else {
+                        perror("[P1] Blad odczytu stdin");
+                    }
+                    break; // powrót do menu
+                }
+                buffer[strcspn(buffer, "\n")] = '\0';
+
+                if (strcmp(buffer, ".") == 0) {
+                    printf("[P1] Koniec wczytywania z klawiatury.\n");
+                    break;
+                }
+
+                // Dodaj '\n' na końcu, żeby P2 widział koniec linii
+                size_t len = strlen(buffer);
+                buffer[len]   = '\n';
+                buffer[len+1] = '\0';
+
+                // Zapis do FIFO
+                ssize_t wret;
+                do {
+                    wret = write(fd, buffer, len+1);
+                } while (wret == -1 && errno == EINTR);
+                if (wret < 0) {
+                    perror("[P1] write FIFO error");
+                    break;
+                }
+
+                // Czekamy na "done" od P3 (kolejka msgid_p3_p1)
+                struct msg_data m;
+                if (msgrcv(msgid_p3_p1, &m, sizeof(m.msg_text), 1, 0) == -1) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    perror("[P1] msgrcv p3->p1");
+                    break;
+                }
+                // Otrzymaliśmy potwierdzenie "done"
+            }
+        }
+        else if (choice == 2) {
+            // --- Czytanie z pliku ---
+            char filename[256];
+            printf("[P1] Podaj nazwe pliku: ");
+            fflush(stdout);
+            if (!fgets(filename, sizeof(filename), stdin)) {
+                fprintf(stderr, "[P1] Blad odczytu nazwy pliku.\n");
+                continue;
+            }
+            filename[strcspn(filename, "\n")] = '\0';
+
+            FILE *file = fopen(filename, "r");
+            if (!file) {
+                perror("[P1] Nie mozna otworzyc pliku");
+                continue;
+            }
+
+            while (1) {
+                char *p = fgets(buffer, ByteSize, file);
+                if (!p) {
+                    if (!feof(file)) {
+                        perror("[P1] blad odczytu pliku");
+                    }
+                    printf("[P1] Koniec pliku.\n");
+                    break;
+                }
+                printf("[P1] Wczytano z pliku: %s", buffer);
+
+                size_t toWrite = strlen(buffer);
+                // Zapis do FIFO
+                ssize_t wret;
+                do {
+                    wret = write(fd, buffer, toWrite);
+                } while (wret == -1 && errno == EINTR);
+                if (wret < 0) {
+                    perror("[P1] write FIFO error");
+                    break;
+                }
+
+                // Oczekiwanie na "done" od P3
+                struct msg_data m;
+                if (msgrcv(msgid_p3_p1, &m, sizeof(m.msg_text), 1, 0) == -1) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    perror("[P1] msgrcv p3->p1");
+                    break;
+                }
+            }
+            fclose(file);
+        }
+        else {
+            printf("[P1] Nieprawidlowy wybor.\n");
+        }
+    }
+
+    close(fd);
+    printf("[P1] Koncze dzialanie.\n");
+    fflush(stdout);
+    exit(0);
+}
+
+// ----- P2 -----
+void P2(char *shared_memory) {
+    // Nowe handlery (SIGUSR2 od P1 itd.)
+    p2_signals();
+
+    // Otwieramy FIFO do odczytu
+    int fd = open(FIFO_NAME, O_RDONLY);
+    if (fd < 0) {
+        report_and_exit("open FIFO (P2) error", 1);
+    }
+    FILE *f = fdopen(fd, "r");
+    if (!f) {
+        report_and_exit("fdopen (P2) error", 1);
+    }
+
+    while (1) {
+        // Odczyt jednej linii z FIFO
+        char *res = fgets(buffer, ByteSize, f);
+        if (!res) {
+            if (feof(f)) {
+                printf("[P2] Koniec FIFO (EOF)\n");
+            } else {
+                perror("[P2] fgets FIFO error");
+            }
+            break;
+        }
+        printf("[P2] Dane odczytane z FIFO: %s", buffer);
+
+        // Liczymy znaki i przekazujemy do pamięci dzielonej
+        int ilosc = zlicz_znaki(buffer);
+        sprintf(shared_memory, "%d", ilosc);
+        printf("[P2] Ilosc znakow: %d => przekazuje do P3\n", ilosc);
+
+        // Poinformuj P3: sem_post(sem_3)
+        if (sem_post(sem_3) == -1) {
+            if (errno != EINTR) {
+                perror("[P2] sem_post(sem_3)");
+                break;
+            }
+        }
+
+        // Czekamy, aż P3 skończy -> sem_wait(sem_2)
+        if (sem_wait(sem_2) == -1) {
+            if (errno != EINTR) {
+                perror("[P2] sem_wait(sem_2)");
+                break;
+            }
+        }
+    }
+
+    fclose(f);
+    printf("[P2] Koncze dzialanie.\n");
+    fflush(stdout);
+    exit(0);
+}
+
+// ----- P3 -----
+void P3(char *shared_memory) {
+    // Rejestracja przechwytywania SIGINT, SIGTERM, SIGTSTP, SIGCONT
+    p3_signals();
+
+    while (1) {
+        // czekamy na sem_3 od P2
+        if (sem_wait(sem_3) == -1) {
+            if (errno != EINTR) {
+                perror("[P3] sem_wait(sem_3)");
+                break;
+            }
+        }
+
+        // Odczyt z pamięci dzielonej
+        printf("[P3] Dane odczytane z PD: %s\n", shared_memory);
+        printf("-------------------------------\n");
+
+        // sygnalizujemy P2 (sem_2)
+        if (sem_post(sem_2) == -1) {
+            if (errno != EINTR) {
+                perror("[P3] sem_post(sem_2)");
+                break;
+            }
+        }
+
+        // Wysyłamy "done" do P1 (aby zwolnić go z msgrcv)
+        struct msg_data m;
+        m.msg_type = 1;
+        strcpy(m.msg_text, "done");
+        if (msgsnd(msgid_p3_p1, &m, sizeof(m.msg_text), 0) == -1) {
+            perror("[P3] msgsnd p3->p1");
+        }
+    }
+
+    printf("[P3] Koncze dzialanie.\n");
+    fflush(stdout);
+    exit(0);
+}
+
+
+// ----- Funkcja main (rodzic) -----
+int main() {
+    // Na wszelki wypadek usuwamy stare semafory/PW
+    sem_unlink("/sem_2");
+    sem_unlink("/sem_3");
+    shm_unlink(SHM_NAME);
+    unlink(FIFO_NAME);
+
+    // *** Nowa kolejka do sygnałów (zamiast msgidSigP1/P2/P3/Parent) ***
+    msgq_id = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
+    if (msgq_id < 0) {
+        report_and_exit("msgget (IPC_PRIVATE) error", 1);
+    }
+
+    // *** Kolejka danych "done" P3->P1 ***
+    key_t key_p3_p1 = ftok(".", 'C');
+    msgid_p3_p1 = msgget(key_p3_p1, 0666 | IPC_CREAT);
+    if (msgid_p3_p1 == -1) {
+        report_and_exit("msgget p3->p1 error", 1);
+    }
+
+    // Tworzymy semafory
+    sem_2 = sem_open("/sem_2", O_CREAT | O_EXCL, 0666, 0);
+    sem_3 = sem_open("/sem_3", O_CREAT | O_EXCL, 0666, 0);
+    if (sem_2 == SEM_FAILED || sem_3 == SEM_FAILED) {
+        report_and_exit("sem_open error", 1);
+    }
+
+    // Pamięć dzielona
+    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        report_and_exit("shm_open error", 1);
+    }
+    if (ftruncate(shm_fd, ByteSize) == -1) {
+        report_and_exit("ftruncate error", 1);
+    }
+    char *shared_memory = mmap(NULL, ByteSize, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shared_memory == MAP_FAILED) {
+        report_and_exit("mmap error", 1);
+    }
+
+    // Rejestrujemy handler rodzica na SIGUSR1 (wysyłany przez P3)
+    struct sigaction sa_parent;
+    memset(&sa_parent, 0, sizeof(sa_parent));
+    sa_parent.sa_handler = parent_sigusr1_handler;
+    sigaction(SIGUSR1, &sa_parent, NULL);
+
+    // Możemy zignorować inne sygnały w rodzicu, np.:
+    for (int i=1; i<32; i++) {
+        if (i == SIGKILL || i == SIGSTOP || i == SIGUSR1) continue;
+        signal(i, SIG_IGN);
+    }
+
+    // Tworzenie procesów
+    pid1 = fork();
+    if (pid1 == 0) {
+        P1();
+    }
+
+    pid2 = fork();
+    if (pid2 == 0) {
+        P2(shared_memory);
+    }
+
+    pid3 = fork();
+    if (pid3 == 0) {
+        P3(shared_memory);
+    }
+
+    // Rodzic czeka na zakończenie dzieci
+    for (int i = 0; i < 3; i++) {
+        wait(NULL);
+    }
+
+    // Sprzątanie
+    sem_unlink("/sem_2");
+    sem_unlink("/sem_3");
+    shm_unlink(SHM_NAME);
+    msgctl(msgid_p3_p1, IPC_RMID, NULL);
+
+    // Usunięcie nowej kolejki do sygnałów
+    msgctl(msgq_id, IPC_RMID, NULL);
+
+    printf("[Parent] Wszystkie procesy zakonczone. Zasoby zwolnione.\n");
+    return 0;
+}
