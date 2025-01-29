@@ -1,0 +1,206 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <pthread.h>
+
+#define ROZMIAR_BUF 1024 
+
+char BUF[ROZMIAR_BUF];
+char Szyfr[ROZMIAR_BUF];
+
+pthread_mutex_t mutexBUF; //mutex dla BUF
+pthread_mutex_t mutexSzyfr; //mutex dla Szyfr
+pthread_cond_t condBUF; //zmienna warunkowa dla BUF
+pthread_cond_t condSzyfr; //zmienna warunkowa dla Szyfr 
+int BuforGotowy = 0;
+int SzyfrGotowy = 0;
+
+void szyfruj(const char *input, char *output) {
+    //przykladowe szyfrowanie - przesuniecie liter o 2 w alfabecie
+    int i;
+    for (i = 0; input[i] != '\0'; i++) {
+        if (input[i] >= 'a' && input[i] <= 'z') {
+            output[i] = ((input[i] - 'a' + 2) % 26) + 'a';
+        } else if (input[i] >= 'A' && input[i] <= 'Z') {
+            output[i] = ((input[i] - 'A' + 2) % 26) + 'A';
+        } else {
+            output[i] = input[i];
+        }
+    }
+    output[i] = '\0';
+}
+
+void *T1(void *arg) {
+    FILE *input_file = fopen("wejscie", "r");
+    if (!input_file) {
+        perror("Blad otwarcia pliku wejsciowego");
+        exit(EXIT_FAILURE);
+    }
+
+    char temp_buf[ROZMIAR_BUF];
+    while (fgets(temp_buf, ROZMIAR_BUF, input_file)) {
+        size_t len = strlen(temp_buf);
+        if (len > 0 && temp_buf[len-1] == '\n') {
+            temp_buf[len-1] = '\0';
+        }
+        
+        if (len > 0) {  //sprawdzenie czy linia nie jest pusta
+            pthread_mutex_lock(&mutexBUF);
+            while (BuforGotowy) {
+                pthread_cond_wait(&condBUF, &mutexBUF);
+            }
+            
+            strcpy(BUF, temp_buf);
+            BuforGotowy = 1;
+            pthread_cond_signal(&condBUF);
+            pthread_mutex_unlock(&mutexBUF);
+        }
+    }
+
+    //ostatnia linia w pliku (jesli nie konczy się \n)
+    if (!feof(input_file)) {
+        size_t len = strlen(temp_buf);
+        if (len > 0) {
+            pthread_mutex_lock(&mutexBUF);
+            while (BuforGotowy) {
+                pthread_cond_wait(&condBUF, &mutexBUF);
+            }
+            
+            strcpy(BUF, temp_buf);
+            BuforGotowy = 1;
+            pthread_cond_signal(&condBUF);
+            pthread_mutex_unlock(&mutexBUF);
+        }
+    }
+
+    //sygnal zakonczenia
+    pthread_mutex_lock(&mutexBUF);
+    while (BuforGotowy) {
+        pthread_cond_wait(&condBUF, &mutexBUF);
+    }
+    strcpy(BUF, "EOF");
+    BuforGotowy = 1;
+    pthread_cond_signal(&condBUF);
+    pthread_mutex_unlock(&mutexBUF);
+
+    fclose(input_file);
+    return NULL;
+}
+
+void *T2(void *arg) {
+    while (1) {
+        pthread_mutex_lock(&mutexBUF);
+        while (!BuforGotowy) {
+            pthread_cond_wait(&condBUF, &mutexBUF); //czekaj na dane w BUF
+        }
+
+        if (strcmp(BUF, "EOF") == 0) {
+            pthread_mutex_unlock(&mutexBUF);
+            break;
+        }
+
+        char local_buf[ROZMIAR_BUF];
+        strcpy(local_buf, BUF); //kopiowanie danych z BUF
+        BuforGotowy = 0; //BUF jest teraz pusty
+        pthread_cond_signal(&condBUF); //powiadomienie T1, ze BUF jest pusty
+        pthread_mutex_unlock(&mutexBUF);
+
+        char local_szyfr[ROZMIAR_BUF];
+        szyfruj(local_buf, local_szyfr);
+
+        pthread_mutex_lock(&mutexSzyfr);
+        while (SzyfrGotowy) {
+            pthread_cond_wait(&condSzyfr, &mutexSzyfr); //czekaj na wolny Szyfr
+        }
+
+        strcpy(Szyfr, local_szyfr);
+        SzyfrGotowy = 1;
+        pthread_cond_signal(&condSzyfr); //powiadomienie T3, ze Szyfr ma dane
+        pthread_mutex_unlock(&mutexSzyfr);
+    }
+
+    //przekazanie EOF do T3
+    pthread_mutex_lock(&mutexSzyfr);
+    strcpy(Szyfr, "EOF");
+    SzyfrGotowy = 1;
+    pthread_cond_signal(&condSzyfr);
+    pthread_mutex_unlock(&mutexSzyfr);
+
+    return NULL;
+}
+
+void *T3(void *arg) {
+    FILE *output_file = fopen("wyjscie", "w");
+    if (!output_file) {
+        perror("Blad otwarcia pliku wyjsciowego");
+        exit(EXIT_FAILURE);
+    }
+
+    while (1) {
+        pthread_mutex_lock(&mutexSzyfr);
+        while (!SzyfrGotowy) {
+            pthread_cond_wait(&condSzyfr, &mutexSzyfr); //czekaj na dane w Szyfr
+        }
+
+        if (strcmp(Szyfr, "EOF") == 0) {
+            pthread_mutex_unlock(&mutexSzyfr);
+            break;
+        }
+
+        //zapisywanie do pliku
+        fprintf(output_file, "%s", Szyfr);
+        fprintf(output_file, "\n");
+        fflush(output_file);
+
+        SzyfrGotowy = 0; //Szyfr jest teraz pusty
+        pthread_cond_signal(&condSzyfr); //powiadomienie T2, że Szyfr jest pusty
+        pthread_mutex_unlock(&mutexSzyfr);
+    }
+
+    fclose(output_file);
+    return NULL;
+}
+
+int main(){
+    //inicjalizacja mutexow
+    if (pthread_mutex_init(&mutexBUF, NULL) != 0) {
+        perror("Blad inicjalizacji mutexBUF");
+        return 1;
+    }
+
+    if (pthread_mutex_init(&mutexSzyfr, NULL) != 0) {
+        perror("Blad inicjalizacji mutexSzyfr");
+        return 1;
+    }
+
+    //inicjalizacja zmiennych warunkowych
+    if (pthread_cond_init(&condBUF, NULL) != 0) {
+        perror("Blad inicjalizacji condBUF");
+        return 1;
+    }
+
+    if (pthread_cond_init(&condSzyfr, NULL) != 0) {
+        perror("Blad inicjalizacji condSzyfr");
+        return 1;
+    }
+
+    pthread_t t1, t2, t3;
+
+    //tworzenie watkow 
+    pthread_create(&t1, NULL, T1, NULL);
+    pthread_create(&t2, NULL, T2, NULL);
+    pthread_create(&t3, NULL, T3, NULL);
+
+    //dolaczanie watkow
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    pthread_join(t3, NULL);
+
+    pthread_mutex_destroy(&mutexBUF);
+    pthread_mutex_destroy(&mutexSzyfr);
+    pthread_cond_destroy(&condBUF);
+    pthread_cond_destroy(&condSzyfr);
+
+    printf("Zakonczono dzialanie. Wyniki zapisano w pliku 'wyjscie'.\n");
+    return 0;
+}
