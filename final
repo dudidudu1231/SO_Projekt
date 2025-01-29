@@ -13,35 +13,24 @@
 #include <signal.h>
 #include <sys/msg.h>
 
-// ***********************************************
-// *** USTAWIENIA STAŁE, STRUKTURA I KOLEJKA "DONE"
-// ***********************************************
-
 #define FIFO_NAME   "/home/maciek/Documents/CPrograms/projekt/my_fifo"
 #define ByteSize    256
 #define SHM_NAME    "/shared_memory"
 
-// Kolejka dla "done" (P3 -> P1)
 struct msg_data {
     long msg_type;
     char msg_text[20];
 };
 int msgid_p3_p1;  // do przesyłania "done"
 
-
-// ***********************************************
-// ******** Nowy mechanizm powiadamiania *********
-// ****** (zastępuje stary łańcuch SIGUSR1) ******
-// ***********************************************
-//
 // Struktura do wysyłania sygnałów do rodzica:
 typedef struct {
-    long mtype; // 1 = od P3 do rodzica, 2 = od rodzica do P1
+    long mtype;
     int  signal;
 } msgbuf;
 
-static int msgq_id;                 // jedna kolejka do sygnałów
-static volatile sig_atomic_t paused = 0; // flaga tylko w rodzicu (podgląd)
+int msgq_id; // jedna kolejka do sygnałów
+volatile sig_atomic_t paused = 0; // flaga 
 
 // PID-y procesów potomnych
 pid_t pid1, pid2, pid3;
@@ -81,7 +70,7 @@ void parent_sigusr1_handler(int sig) {
         paused = 0;
     }
     else {
-        // Np. SIGTERM, SIGINT - tutaj wstawiamy logikę łańcucha: P1 -> P2
+        // Np. SIGTERM, - tutaj wstawiamy logikę łańcucha: P1 -> P2
         // Najpierw wyślemy do kolejki mtype=2 i sygnał, potem SIGUSR1 do P1
         msg.mtype = 2;
         if (msgsnd(msgq_id, &msg, sizeof(int), 0) == -1) {
@@ -92,8 +81,7 @@ void parent_sigusr1_handler(int sig) {
     }
 }
 
-// Handler P3 – przechwytuje SIGINT, SIGTERM, SIGTSTP, SIGCONT
-static void p3_signal_handler(int sig) {
+void p3_signal_handler(int sig) {
     printf("[P3, PID=%d] Otrzymałem sygnał %d\n", getpid(), sig);
 
     // Tworzymy komunikat do rodzica
@@ -111,7 +99,6 @@ static void p3_signal_handler(int sig) {
 
     // Jeśli to SIGTSTP albo SIGCONT, w tym mechanizmie przywracamy domyślną obsługę
     // i natychmiast podnosimy sygnał, żeby faktycznie zatrzymał/wznowił ten proces.
-    // (Tak było w kodzie #2)
     if (sig == SIGTSTP || sig == SIGCONT) {
         signal(sig, SIG_DFL);
         raise(sig);
@@ -119,7 +106,7 @@ static void p3_signal_handler(int sig) {
 }
 
 // Handler P1 – wywoływany, gdy P1 dostanie SIGUSR1 od rodzica
-static void p1_signal_handler(int sig) {
+void p1_signal_handler(int sig) {
     printf("[P1, PID=%d] Odebrałem powiadomienie od rodzica\n", getpid());
 
     // Odczyt komunikatu mtype=2 (co rodzic właśnie wysłał)
@@ -132,48 +119,37 @@ static void p1_signal_handler(int sig) {
     kill(pid2, SIGUSR2);
 
     // Jeśli chcemy, możemy tu dodać logikę:
-    //   jeśli msg.signal == SIGTERM || SIGINT => p1 kończy
     //   np. exit(0);
 }
 
 // Handler P2 – wywoływany, gdy P2 dostanie SIGUSR2 od P1
-static void p2_signal_handler(int sig) {
+void p2_signal_handler(int sig) {
     printf("[P2, PID=%d] Odebrałem powiadomienie od P1 (SIGUSR2)\n", getpid());
-    // Analogicznie – można tu dodać logikę kończenia, jeśli sygnał to SIGTERM itp.
 }
 
 // Funkcje rejestrujące obsługę sygnałów w P1, P2, P3 (zamiast starego łańcucha)
-static void p1_signals(void) {
+void p1_signals(void) {
     signal(SIGUSR1, p1_signal_handler);
-    // Ignorujemy np. SIGINT/SIGTERM/SIGTSTP/SIGCONT,
     // bo i tak je obsługuje nowy mechanizm łańcuchowy.
-    signal(SIGINT,  SIG_IGN);
     signal(SIGTERM, SIG_IGN);
     signal(SIGTSTP, SIG_IGN);
     signal(SIGCONT, SIG_IGN);
 }
 
-static void p2_signals(void) {
+void p2_signals(void) {
     signal(SIGUSR2, p2_signal_handler);
-    signal(SIGINT,  SIG_IGN);
+
     signal(SIGTERM, SIG_IGN);
     signal(SIGTSTP, SIG_IGN);
     signal(SIGCONT, SIG_IGN);
 }
 
-static void p3_signals(void) {
+void p3_signals(void) {
     // P3 nasłuchuje sygnałów i obsługuje w p3_signal_handler
-    signal(SIGINT,  p3_signal_handler);
     signal(SIGTERM, p3_signal_handler);
     signal(SIGTSTP, p3_signal_handler);
     signal(SIGCONT, p3_signal_handler);
 }
-
-
-// ***********************************************
-// ************ Kod wspólny (jak w #1) ***********
-// ****** (FIFO, semafory, pamięć dzielona) ******
-// ***********************************************
 
 sem_t *sem_2, *sem_3;
 char   buffer[ByteSize];
@@ -394,7 +370,7 @@ void P2(char *shared_memory) {
 
 // ----- P3 -----
 void P3(char *shared_memory) {
-    // Rejestracja przechwytywania SIGINT, SIGTERM, SIGTSTP, SIGCONT
+    // Rejestracja przechwytywania SIGTERM, SIGTSTP, SIGCONT
     p3_signals();
 
     while (1) {
